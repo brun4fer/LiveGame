@@ -1,0 +1,405 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum VideoStorageStatus {
+  LOCAL
+  UPLOADING
+  READY
+  FAILED
+}
+
+enum LiveSessionStatus {
+  PREPARING
+  LIVE
+  ENDED
+  FAILED
+}
+
+enum LiveSourceType {
+  BROWSER_CAMERA
+  EXTERNAL_ENCODER
+}
+
+enum RecordingSegmentStatus {
+  UPLOADING
+  READY
+  FAILED
+}
+
+enum PlaylistVisibility {
+  PERSONAL
+  WORKSPACE
+}
+
+model User {
+  id                 String   @id @default(cuid())
+  name               String
+  username           String   @unique
+  email              String?  @unique
+  passwordHash       String?
+  mustChangePassword Boolean  @default(true)
+  role               String   @default("analyst")
+  workspaceId        String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  presences WorkspacePresence[]
+  createdMoments Moment[] @relation("MomentCreatedBy")
+  startedLiveSessions LiveSession[] @relation("LiveSessionStartedBy")
+  playlists Playlist[]
+  createdInvites WorkspaceInvite[] @relation("InviteCreatedBy")
+  claimedInvites WorkspaceInvite[] @relation("InviteClaimedBy")
+
+  @@index([workspaceId])
+}
+
+model Workspace {
+  id                        String   @id @default(cuid())
+  name                      String
+  managementPasswordHash    String?
+  managementPasswordVersion Int      @default(0)
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+
+  users          User[]
+  seasons        Season[]
+  clubs          Club[]
+  competitions   Competition[]
+  matches        Match[]
+  momentTypes    MomentType[]
+  subMomentTypes SubMomentType[]
+  presences      WorkspacePresence[]
+  playlists      Playlist[]
+  invites        WorkspaceInvite[]
+}
+
+model WorkspaceInvite {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  codeHash        String   @unique
+  role            String   @default("analyst")
+  createdByUserId String
+  claimedByUserId String?
+  expiresAt       DateTime
+  claimedAt       DateTime?
+  createdAt       DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy User @relation("InviteCreatedBy", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  claimedBy User? @relation("InviteClaimedBy", fields: [claimedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, expiresAt])
+}
+
+model WorkspacePresence {
+  id          String   @id @default(cuid())
+  workspaceId String
+  userId      String
+  clientId    String
+  lastSeenAt  DateTime
+  liveSessionId String?
+  playbackPositionSeconds Float?
+  atLiveEdge Boolean @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  liveSession LiveSession? @relation(fields: [liveSessionId], references: [id], onDelete: SetNull)
+
+  @@unique([workspaceId, clientId])
+  @@index([workspaceId, lastSeenAt])
+  @@index([userId])
+  @@index([liveSessionId, lastSeenAt])
+}
+
+model Season {
+  id        String   @id @default(cuid())
+  name      String
+  workspaceId String
+  startDate DateTime?
+  endDate   DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  competitions Competition[]
+  matches      Match[]
+  workspace    Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId])
+  @@unique([workspaceId, name])
+}
+
+model Club {
+  id        String   @id @default(cuid())
+  name      String
+  workspaceId String
+  shortName String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  competitions   Competition[]
+  opponentMatches Match[] @relation("OpponentClub")
+  workspace       Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId])
+  @@unique([workspaceId, name])
+}
+
+model Competition {
+  id        String   @id @default(cuid())
+  name      String
+  seasonId  String
+  workspaceId String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  season Season @relation(fields: [seasonId], references: [id], onDelete: Restrict)
+  clubs   Club[]
+  matches Match[]
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId])
+  @@index([seasonId])
+  @@unique([workspaceId, seasonId, name])
+}
+
+model Match {
+  id                         String   @id @default(cuid())
+  title                      String
+  opponentName               String
+  competition                String?
+  season                     String?
+  roundName                  String?
+  matchDate                  DateTime?
+  venue                      String?
+  notes                      String?
+  firstHalfStartSeconds      Float?
+  firstHalfEndSeconds        Float?
+  secondHalfStartSeconds     Float?
+  secondHalfEndSeconds       Float?
+  firstHalfAttackDirection   String   @default("left_to_right")
+  secondHalfAttackDirection  String   @default("right_to_left")
+  seasonId                   String?
+  opponentClubId             String?
+  competitionId              String?
+  workspaceId                String
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  video             Video?
+  moments           Moment[]
+  liveSessions      LiveSession[]
+  seasonRecord      Season?      @relation(fields: [seasonId], references: [id], onDelete: SetNull)
+  opponentClub      Club?        @relation("OpponentClub", fields: [opponentClubId], references: [id], onDelete: SetNull)
+  competitionRecord Competition? @relation(fields: [competitionId], references: [id], onDelete: SetNull)
+  workspace         Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId])
+  @@index([seasonId])
+  @@index([opponentClubId])
+  @@index([competitionId])
+}
+
+model LiveSession {
+  id                    String            @id @default(cuid())
+  matchId               String
+  startedByUserId       String
+  status                LiveSessionStatus @default(PREPARING)
+  sourceType            LiveSourceType    @default(BROWSER_CAMERA)
+  provider              String            @default("segment-dvr")
+  providerSessionId     String?
+  playbackUrl           String?
+  recordingStartedAt    DateTime?
+  startedAt             DateTime?
+  endedAt               DateTime?
+  lastSegmentAt         DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  match       Match              @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  startedBy   User               @relation("LiveSessionStartedBy", fields: [startedByUserId], references: [id], onDelete: Restrict)
+  segments    RecordingSegment[]
+  moments     Moment[]
+  presences   WorkspacePresence[]
+
+  @@index([matchId, status])
+  @@index([startedByUserId])
+}
+
+model RecordingSegment {
+  id                 String                 @id @default(cuid())
+  liveSessionId      String
+  sequence           Int
+  startedAtSeconds   Float
+  durationSeconds    Float?
+  storageKey         String                 @unique
+  mimeType           String
+  fileSize           BigInt?
+  status             RecordingSegmentStatus @default(UPLOADING)
+  createdAt          DateTime               @default(now())
+  readyAt            DateTime?
+
+  liveSession LiveSession @relation(fields: [liveSessionId], references: [id], onDelete: Cascade)
+
+  @@unique([liveSessionId, sequence])
+  @@index([liveSessionId, status, sequence])
+}
+
+model Video {
+  id              String   @id @default(cuid())
+  matchId         String   @unique
+  fileName        String
+  fileSize        BigInt
+  durationSeconds Float
+  mimeType        String
+  lastModified    DateTime?
+  storageKey      String?  @unique
+  storageStatus   VideoStorageStatus @default(LOCAL)
+  uploadId        String?
+  etag            String?
+  uploadedAt      DateTime?
+  mediaAssetId    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@index([mediaAssetId])
+}
+
+model MomentType {
+  id              String   @id @default(cuid())
+  name            String
+  code            String
+  workspaceId     String
+  color           String
+  defaultShortcut String?
+  sortOrder       Int      @default(0)
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  moments            Moment[]
+  allowedSubmoments  SubMomentType[] @relation("MomentSubmomentTypes")
+  workspace          Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId])
+  @@unique([workspaceId, code])
+}
+
+model SubMomentType {
+  id                    String   @id @default(cuid())
+  name                  String
+  code                  String
+  workspaceId           String
+  color                 String
+  requiresFieldLocation Boolean  @default(true)
+  requiresGoalLocation  Boolean  @default(false)
+  defaultShortcut       String?
+  sortOrder             Int      @default(0)
+  active                Boolean  @default(true)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  subMoments        SubMoment[]
+  allowedForMoments MomentType[] @relation("MomentSubmomentTypes")
+  workspace         Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId])
+  @@unique([workspaceId, code])
+}
+
+model Moment {
+  id               String   @id @default(cuid())
+  matchId          String
+  momentTypeId     String
+  startTimeSeconds Float
+  endTimeSeconds   Float
+  durationSeconds  Float
+  period            String?
+  notes             String?
+  outcome           String?
+  createdByUserId  String?
+  liveSessionId    String?
+  markedAtSeconds  Float?
+  leadSeconds      Float?   @default(20)
+  capturedFromLive Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  match      Match      @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  momentType MomentType @relation(fields: [momentTypeId], references: [id])
+  subMoments SubMoment[]
+  createdBy  User?       @relation("MomentCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  liveSession LiveSession? @relation(fields: [liveSessionId], references: [id], onDelete: SetNull)
+  playlistItems PlaylistItem[]
+
+  @@index([matchId])
+  @@index([momentTypeId])
+  @@index([createdByUserId])
+  @@index([liveSessionId, markedAtSeconds])
+}
+
+model Playlist {
+  id          String             @id @default(cuid())
+  workspaceId String
+  userId      String
+  name        String
+  isDefault   Boolean            @default(false)
+  visibility  PlaylistVisibility @default(PERSONAL)
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items     PlaylistItem[]
+
+  @@index([workspaceId])
+  @@index([userId])
+  @@unique([userId, name])
+}
+
+model PlaylistItem {
+  id         String   @id @default(cuid())
+  playlistId String
+  momentId   String
+  note       String?
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  playlist Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  moment   Moment   @relation(fields: [momentId], references: [id], onDelete: Cascade)
+
+  @@unique([playlistId, momentId])
+  @@index([momentId])
+}
+
+model SubMoment {
+  id              String   @id @default(cuid())
+  momentId        String
+  subMomentTypeId String
+  timeSeconds     Float?
+  fieldX          Float?
+  fieldY          Float?
+  goalX           Float?
+  goalY           Float?
+  foot            String?
+  notes           String?
+  outcome         String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  moment        Moment        @relation(fields: [momentId], references: [id], onDelete: Cascade)
+  subMomentType SubMomentType @relation(fields: [subMomentTypeId], references: [id])
+
+  @@index([momentId])
+  @@index([subMomentTypeId])
+}

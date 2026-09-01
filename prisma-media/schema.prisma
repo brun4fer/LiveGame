@@ -1,0 +1,96 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/media-client"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("MEDIA_DATABASE_URL")
+  directUrl = env("MEDIA_DIRECT_URL")
+}
+
+model MediaWorkspace {
+  id          String           @id @default(cuid())
+  displayName String
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  accounts    MediaAccount[]
+  assets      MediaAsset[]
+  references  MediaReference[]
+  linkTokens  MediaLinkToken[]
+}
+
+model MediaAccount {
+  id                  String         @id @default(cuid())
+  mediaWorkspaceId    String
+  appId               String
+  externalWorkspaceId String
+  externalUserId      String?
+  username            String?
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+  mediaWorkspace      MediaWorkspace @relation(fields: [mediaWorkspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([appId, externalWorkspaceId])
+  @@index([mediaWorkspaceId])
+}
+
+model MediaAsset {
+  id               String             @id @default(cuid())
+  mediaWorkspaceId String
+  createdByAppId   String
+  fileName         String
+  fileSize         BigInt
+  durationSeconds  Float
+  mimeType         String
+  lastModified     DateTime?
+  storageKey       String             @unique
+  storageStatus    MediaStorageStatus @default(UPLOADING)
+  uploadId         String?
+  etag             String?
+  uploadedAt       DateTime?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  mediaWorkspace   MediaWorkspace     @relation(fields: [mediaWorkspaceId], references: [id], onDelete: Cascade)
+  references       MediaReference[]
+
+  @@index([mediaWorkspaceId, storageStatus])
+  @@index([mediaWorkspaceId, fileSize])
+}
+
+model MediaReference {
+  id               String         @id @default(cuid())
+  mediaWorkspaceId String
+  mediaAssetId     String
+  appId            String
+  externalVideoId  String
+  externalMatchId  String
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  mediaWorkspace   MediaWorkspace @relation(fields: [mediaWorkspaceId], references: [id], onDelete: Cascade)
+  mediaAsset       MediaAsset     @relation(fields: [mediaAssetId], references: [id], onDelete: Restrict)
+
+  @@unique([appId, externalVideoId])
+  @@index([mediaWorkspaceId])
+  @@index([mediaAssetId])
+}
+
+model MediaLinkToken {
+  id               String         @id @default(cuid())
+  mediaWorkspaceId String
+  tokenHash        String         @unique
+  expiresAt        DateTime
+  usedAt           DateTime?
+  createdAt        DateTime       @default(now())
+  mediaWorkspace   MediaWorkspace @relation(fields: [mediaWorkspaceId], references: [id], onDelete: Cascade)
+
+  @@index([mediaWorkspaceId])
+  @@index([expiresAt])
+}
+
+enum MediaStorageStatus {
+  UPLOADING
+  READY
+  FAILED
+}
+
