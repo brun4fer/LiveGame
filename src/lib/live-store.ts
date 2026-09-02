@@ -58,7 +58,7 @@ export async function getCurrentLiveSession(matchId: string, afterSequence?: num
   const { workspace } = await requireWorkspace();
   await prisma.match.findFirstOrThrow({ where: { id: matchId, workspaceId: workspace.id }, select: { id: true } });
   const session = await prisma.liveSession.findFirst({
-    where: { matchId, status: { in: [LiveSessionStatus.PREPARING, LiveSessionStatus.LIVE] } },
+    where: { matchId },
     include: {
       ...liveSessionInclude,
       segments: {
