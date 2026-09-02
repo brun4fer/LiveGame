@@ -9,6 +9,10 @@ Collaborative live football analysis. A camera operator records continuously whi
 3. Run `npm run prisma:migrate` and `npm run prisma:seed` for a new database.
 4. Run `npm run dev` and open `http://localhost:3000`.
 
+## Database-free demo
+
+To preview the live workflow before configuring PostgreSQL or R2, run `npm run dev` and open `http://localhost:3000/demo`. No account or environment file is required. Recording segments, marked moments and the demo playlist remain in the current browser tab and are cleared when the page is refreshed.
+
 The application is derived from the Team Analysis workflow, with the uploaded-video flow being replaced by continuous live recording and DVR-style playback.
 
 The private R2 bucket must allow production and local browser origins to use `PUT` and `GET`, accept `Content-Type`, and expose `ETag`. Camera capture requires a secure HTTPS origin outside localhost.
