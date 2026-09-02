@@ -78,6 +78,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const archiveWriteChainRef = useRef<Promise<void>>(Promise.resolve());
   const archiveFinalizedRef = useRef<Promise<void> | null>(null);
   const archiveFileNameRef = useRef<string | null>(null);
+  const localSegmentUrlsRef = useRef(new Map<number, string>());
   const sequenceRef = useRef(0);
   const fetchedSequenceRef = useRef(-1);
   const replayCommandRef = useRef(0);
@@ -160,6 +161,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
     if (archiveRecorderRef.current?.state === "recording") archiveRecorderRef.current.stop();
     streamRef.current?.getTracks().forEach((track) => track.stop());
+    for (const url of localSegmentUrlsRef.current.values()) URL.revokeObjectURL(url);
+    localSegmentUrlsRef.current.clear();
   }, []);
 
   useEffect(() => {
@@ -438,6 +441,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     }
     try {
       const next = await apiFetch<LiveSessionRecord>(`/api/matches/${matchId}/live`, { method: "POST", body: JSON.stringify({ sourceType: "BROWSER_CAMERA" }) });
+      for (const url of localSegmentUrlsRef.current.values()) URL.revokeObjectURL(url);
+      localSegmentUrlsRef.current.clear();
       setSession(next);
       sequenceRef.current = Math.max(...next.segments.map((segment) => segment.sequence + 1), 0);
       fetchedSequenceRef.current = Math.max(...next.segments.map((segment) => segment.sequence), -1);
@@ -484,21 +489,44 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       // this completed segment must never introduce a gap in the camera capture.
       if (recordingRef.current) void recordNextSegment(activeSession);
       const upload = preparation.then(async ({ prepared, error }) => {
-        if (!prepared) throw error instanceof Error ? error : new Error(`Recording segment ${sequence + 1} could not be prepared.`);
-        if (!blob.size) throw new Error(`Recording segment ${prepared.sequence + 1} contains no video data.`);
+        if (!blob.size) throw new Error(`Recording segment ${sequence + 1} contains no video data.`);
+        const localId = prepared?.id || `local-${activeSession.id}-${sequence}`;
+        const localPlaybackUrl = URL.createObjectURL(blob);
+        const previousUrl = localSegmentUrlsRef.current.get(sequence);
+        if (previousUrl) URL.revokeObjectURL(previousUrl);
+        localSegmentUrlsRef.current.set(sequence, localPlaybackUrl);
+        const localSegment: LiveSegmentRecord = {
+          id: localId,
+          sequence,
+          startedAtSeconds,
+          durationSeconds,
+          mimeType,
+          fileSize: String(blob.size),
+          status: "READY",
+          readyAt: new Date().toISOString(),
+          playbackUrl: localPlaybackUrl,
+          playbackUrlExpiresAt: null,
+        };
+        setSession((current) => current && current.id === activeSession.id
+          ? { ...current, segments: [...current.segments.filter((segment) => segment.sequence !== sequence), localSegment].sort((a, b) => a.sequence - b.sequence) }
+          : current);
+        if (!prepared) throw error instanceof Error ? error : new Error(`Cloud replay segment ${sequence + 1} could not be prepared.`);
         try {
-          await uploadSegment(activeSession.id, prepared, blob, durationSeconds);
+          const saved = await uploadSegment(activeSession.id, prepared, blob, durationSeconds);
+          setSession((current) => current && current.id === activeSession.id
+            ? { ...current, segments: [...current.segments.filter((segment) => segment.sequence !== sequence), saved].sort((a, b) => a.sequence - b.sequence) }
+            : current);
+          window.setTimeout(() => {
+            if (localSegmentUrlsRef.current.get(sequence) !== localPlaybackUrl) return;
+            URL.revokeObjectURL(localPlaybackUrl);
+            localSegmentUrlsRef.current.delete(sequence);
+          }, 1_000);
         } catch (uploadError) {
           await apiFetch(`/api/live-sessions/${activeSession.id}/segments/${prepared.id}`, { method: "DELETE" }).catch(() => undefined);
           throw uploadError;
         }
       }).catch((error) => {
-        recordingRef.current = false;
-        setRecording(false);
-        if (recorderRef.current?.state === "recording") recorderRef.current.stop();
-        void stopLocalArchive().catch(() => undefined);
-        void apiFetch<LiveSessionRecord>(`/api/matches/${matchId}/live`, { method: "PATCH" }).then(setSession).catch(() => undefined);
-        setNotice(error instanceof Error ? error.message : `Recording segment ${sequence + 1} failed.`);
+        setNotice(`${error instanceof Error ? error.message : `Cloud replay segment ${sequence + 1} failed.`} Local replay and recording are still running.`);
       });
       pendingUploadsRef.current.add(upload);
       void upload.finally(() => pendingUploadsRef.current.delete(upload));
@@ -508,12 +536,12 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   }
 
   async function uploadSegment(liveSessionId: string, prepared: PreparedSegment, blob: Blob, durationSeconds: number) {
-    if (!blob.size) return;
+    if (!blob.size) throw new Error(`Recording segment ${prepared.sequence + 1} contains no video data.`);
     const response = await fetch(prepared.uploadUrl, { method: "PUT", headers: { "Content-Type": blob.type }, body: blob });
     if (!response.ok) throw new Error(`Recording segment ${prepared.sequence + 1} could not be stored.`);
     const saved = await apiFetch<LiveSegmentRecord>(`/api/live-sessions/${liveSessionId}/segments/${prepared.id}`, { method: "PATCH", body: JSON.stringify({ durationSeconds, fileSize: blob.size }) });
     fetchedSequenceRef.current = Math.max(fetchedSequenceRef.current, saved.sequence);
-    setSession((current) => current ? mergeLiveSession(current, { ...current, segments: [saved] }) : current);
+    return saved;
   }
 
   async function stopLive() {
