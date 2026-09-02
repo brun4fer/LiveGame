@@ -23,7 +23,7 @@ async function validSession(token?: string) {
 
 export async function middleware(request: NextRequest) {
   const path = request.nextUrl.pathname;
-  if (publicPaths.includes(path) || path.startsWith("/demo") || path.startsWith("/_next") || path.includes(".")) return NextResponse.next();
+  if (publicPaths.includes(path) || path.startsWith("/_next") || path.includes(".")) return NextResponse.next();
   const session = await validSession(request.cookies.get(COOKIE)?.value);
   if (!session) {
     if (path.startsWith("/api/")) return NextResponse.json({ error: "Invalid or expired session." }, { status: 401 });
