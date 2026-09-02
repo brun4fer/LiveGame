@@ -20,6 +20,9 @@ type PreparedSegment = { id: string; uploadUrl: string; sequence: number };
 type LiveViewer = { user: { id: string; name: string; username: string }; atLiveEdge: boolean; playbackPositionSeconds: number | null };
 type ReplayTarget = { segmentId: string; offsetSeconds: number; autoplay: boolean; command: number };
 type PeriodMarkerKey = "firstHalfStartSeconds" | "firstHalfEndSeconds" | "secondHalfStartSeconds" | "secondHalfEndSeconds";
+type LocalWritableFile = { write(data: Blob): Promise<void>; close(): Promise<void>; abort?(): Promise<void> };
+type LocalFileHandle = { name: string; createWritable(): Promise<LocalWritableFile> };
+type LocalDirectoryHandle = { getFileHandle(name: string, options: { create: true }): Promise<LocalFileHandle> };
 
 const periodMarkers: Array<[PeriodMarkerKey, string]> = [
   ["firstHalfStartSeconds", "Start 1st half"],
@@ -49,6 +52,12 @@ function supportedMimeType() {
   return options.find((type) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(type)) || "video/webm";
 }
 
+function localRecordingFileName(title: string) {
+  const safeTitle = title.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "live-game";
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${safeTitle}-${timestamp}.webm`;
+}
+
 function mergeLiveSession(current: LiveSessionRecord | null, next: LiveSessionRecord | null) {
   if (!next || !current || next.id !== current.id) return next;
   const merged = new Map(current.segments.map((segment) => [segment.id, segment]));
@@ -64,6 +73,11 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingRef = useRef(false);
   const recorderTimerRef = useRef<number | null>(null);
+  const archiveRecorderRef = useRef<MediaRecorder | null>(null);
+  const archiveWriterRef = useRef<LocalWritableFile | null>(null);
+  const archiveWriteChainRef = useRef<Promise<void>>(Promise.resolve());
+  const archiveFinalizedRef = useRef<Promise<void> | null>(null);
+  const archiveFileNameRef = useRef<string | null>(null);
   const sequenceRef = useRef(0);
   const fetchedSequenceRef = useRef(-1);
   const replayCommandRef = useRef(0);
@@ -78,6 +92,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [deviceId, setDeviceId] = useState("");
   const [cameraConnected, setCameraConnected] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [localArchiveName, setLocalArchiveName] = useState<string | null>(null);
   const [atLiveEdge, setAtLiveEdge] = useState(true);
   const [replayTarget, setReplayTarget] = useState<ReplayTarget | null>(null);
   const [playheadSeconds, setPlayheadSeconds] = useState(0);
@@ -142,8 +158,19 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     recordingRef.current = false;
     if (recorderTimerRef.current !== null) window.clearTimeout(recorderTimerRef.current);
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    if (archiveRecorderRef.current?.state === "recording") archiveRecorderRef.current.stop();
     streamRef.current?.getTracks().forEach((track) => track.stop());
   }, []);
+
+  useEffect(() => {
+    if (!recording && !stopping) return;
+    const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeaving);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
+  }, [recording, stopping]);
 
   useEffect(() => {
     if (cameraVideoRef.current && streamRef.current) cameraVideoRef.current.srcObject = streamRef.current;
@@ -331,7 +358,80 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     }
   }
 
+  async function chooseLocalRecordingFolder() {
+    const pickerWindow = window as Window & {
+      showDirectoryPicker?: (options?: { id?: string; mode?: "read" | "readwrite"; startIn?: string }) => Promise<LocalDirectoryHandle>;
+    };
+    if (!pickerWindow.showDirectoryPicker) {
+      setNotice("Folder recording requires desktop Chrome or Edge. Open Live Game there and try again.");
+      return null;
+    }
+    try {
+      return await pickerWindow.showDirectoryPicker.call(window, { id: "live-game-recordings", mode: "readwrite", startIn: "videos" });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") setNotice("Live recording was not started because no local folder was selected.");
+      else setNotice(error instanceof Error ? error.message : "The selected folder could not be opened.");
+      return null;
+    }
+  }
+
+  async function startLocalArchive(directory: LocalDirectoryHandle) {
+    if (!streamRef.current || !match) throw new Error("Connect the camera before creating the local recording.");
+    const fileName = localRecordingFileName(match.title);
+    const fileHandle = await directory.getFileHandle(fileName, { create: true });
+    const writer = await fileHandle.createWritable();
+    const mimeType = supportedMimeType();
+    let archiveRecorder: MediaRecorder;
+    try {
+      archiveRecorder = new MediaRecorder(streamRef.current, { mimeType, videoBitsPerSecond: 8_000_000, audioBitsPerSecond: 128_000 });
+    } catch (error) {
+      await writer.abort?.().catch(() => undefined);
+      throw error;
+    }
+
+    archiveWriterRef.current = writer;
+    archiveRecorderRef.current = archiveRecorder;
+    archiveWriteChainRef.current = Promise.resolve();
+    archiveFileNameRef.current = fileName;
+    setLocalArchiveName(fileName);
+    let resolveFinalization!: () => void;
+    let rejectFinalization!: (reason?: unknown) => void;
+    archiveFinalizedRef.current = new Promise<void>((resolve, reject) => {
+      resolveFinalization = resolve;
+      rejectFinalization = reject;
+    });
+    archiveRecorder.ondataavailable = (event) => {
+      if (!event.data.size) return;
+      archiveWriteChainRef.current = archiveWriteChainRef.current.then(() => writer.write(event.data));
+      void archiveWriteChainRef.current.catch(() => undefined);
+    };
+    archiveRecorder.onstop = async () => {
+      try {
+        await archiveWriteChainRef.current;
+        await writer.close();
+        resolveFinalization();
+      } catch (error) {
+        await writer.abort?.().catch(() => undefined);
+        rejectFinalization(error);
+      } finally {
+        archiveRecorderRef.current = null;
+        archiveWriterRef.current = null;
+      }
+    };
+    archiveRecorder.start(1_000);
+  }
+
+  async function stopLocalArchive() {
+    const archiveRecorder = archiveRecorderRef.current;
+    const finalization = archiveFinalizedRef.current;
+    if (archiveRecorder?.state === "recording") archiveRecorder.stop();
+    if (finalization) await finalization;
+    archiveFinalizedRef.current = null;
+  }
+
   async function startLive() {
+    const directory = await chooseLocalRecordingFolder();
+    if (!directory) return;
     if (!streamRef.current) {
       await connectCamera();
       if (!streamRef.current) return;
@@ -345,8 +445,18 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       setRecording(true);
       setAtLiveEdge(true);
       setReplayTarget(null);
+      try {
+        await startLocalArchive(directory);
+      } catch (archiveError) {
+        recordingRef.current = false;
+        setRecording(false);
+        await apiFetch(`/api/matches/${matchId}/live`, { method: "PATCH" }).catch(() => undefined);
+        setSession(null);
+        setNotice(archiveError instanceof Error ? archiveError.message : "The local recording file could not be created.");
+        return;
+      }
       void recordNextSegment(next);
-      setNotice("Live recording started. Replay controls do not interrupt the camera recording.");
+      setNotice(`Live recording started. A local copy is being saved as ${archiveFileNameRef.current}.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The live session could not be started.");
     }
@@ -386,6 +496,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         recordingRef.current = false;
         setRecording(false);
         if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+        void stopLocalArchive().catch(() => undefined);
+        void apiFetch<LiveSessionRecord>(`/api/matches/${matchId}/live`, { method: "PATCH" }).then(setSession).catch(() => undefined);
         setNotice(error instanceof Error ? error.message : `Recording segment ${sequence + 1} failed.`);
       });
       pendingUploadsRef.current.add(upload);
@@ -405,12 +517,13 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   }
 
   async function stopLive() {
+    setStopping(true);
     recordingRef.current = false;
     setRecording(false);
     if (recorderTimerRef.current !== null) window.clearTimeout(recorderTimerRef.current);
     const recorder = recorderRef.current;
     if (recorder?.state === "recording") await new Promise<void>((resolve) => { recorder.addEventListener("stop", () => resolve(), { once: true }); recorder.stop(); });
-    await Promise.allSettled([...pendingUploadsRef.current]);
+    const finalizationResults = await Promise.allSettled([stopLocalArchive(), ...pendingUploadsRef.current]);
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     setCameraConnected(false);
@@ -420,9 +533,14 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       setAtLiveEdge(false);
       const latest = ended.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl).at(-1);
       if (latest) openSegment(latest, 0, false, false);
-      setNotice("The live session ended. The complete DVR timeline remains available for review.");
+      const localFailed = finalizationResults[0]?.status === "rejected";
+      setNotice(localFailed
+        ? "The live session ended, but the local video file could not be finalized. The cloud DVR segments remain available."
+        : `The live session ended. ${archiveFileNameRef.current || "The local video"} is saved and can be uploaded to R2.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The live session could not be stopped cleanly.");
+    } finally {
+      setStopping(false);
     }
   }
 
@@ -547,8 +665,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       </div>
       <div className="flex shrink-0 items-center gap-1 border-l border-white/10 px-1.5">
         <Select aria-label="Camera" title="Camera" className="hidden h-8 w-36 py-0 text-[10px] 2xl:block" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} disabled={recording}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
+        {(recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : null}
         <Button size="icon" className="h-8 w-8" title={cameraConnected ? "Reconnect camera" : "Connect camera"} onClick={() => void connectCamera()} disabled={recording}><Camera size={13} /></Button>
-        {!recording ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording}><Radio size={12} />{activeLive ? canStartCameraRecording ? "Resume recording" : "Live running" : "Start live"}</Button> : <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()}><CircleStop size={12} />End live</Button>}
+        {!recording && !stopping ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording}><Radio size={12} />{activeLive ? canStartCameraRecording ? "Resume recording" : "Live running" : "Start live"}</Button> : <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End live"}</Button>}
       </div>
     </Panel>
 
