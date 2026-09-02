@@ -35,7 +35,7 @@ export async function middleware(request: NextRequest) {
     if (path.startsWith("/api/")) return NextResponse.json({ error: "Change the temporary password before continuing." }, { status: 403 });
     return NextResponse.redirect(new URL("/change-password", request.url));
   }
-  if (session.needsOnboarding && !["/change-password", "/api/auth/change-password", "/onboarding", "/api/account", "/api/account/team", "/api/auth/logout"].includes(path)) {
+  if (session.needsOnboarding && !["/change-password", "/api/auth/change-password", "/onboarding", "/api/account", "/api/account/team", "/api/account/team/join", "/api/auth/logout"].includes(path)) {
     if (path.startsWith("/api/")) return NextResponse.json({ error: "Complete the team setup before continuing." }, { status: 403 });
     return NextResponse.redirect(new URL("/onboarding", request.url));
   }
