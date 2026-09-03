@@ -1,6 +1,7 @@
 import { LiveSessionStatus, LiveSourceType, RecordingSegmentStatus } from "@prisma/client";
 
 import { requireWorkspace } from "@/lib/auth";
+import { cloudflareStreamConfigured, createRealtimeLiveInput, getRealtimeLiveInput } from "@/lib/cloudflare-stream";
 import { getMatchPeriodAtTime } from "@/lib/match-periods";
 import { prisma } from "@/lib/prisma";
 import { createObjectUploadUrl, createPlaybackUrl } from "@/lib/r2";
@@ -82,12 +83,28 @@ export async function getLiveSession(liveSessionId: string) {
 
 export async function startLiveSession(matchId: string, input: Record<string, unknown>) {
   const { user, workspace } = await requireWorkspace();
-  await prisma.match.findFirstOrThrow({ where: { id: matchId, workspaceId: workspace.id }, select: { id: true } });
+  const match = await prisma.match.findFirstOrThrow({ where: { id: matchId, workspaceId: workspace.id }, select: { id: true, title: true } });
   const existing = await prisma.liveSession.findFirst({ where: { matchId, status: { in: [LiveSessionStatus.PREPARING, LiveSessionStatus.LIVE] } }, include: liveSessionInclude });
-  if (existing) return serializeLiveSession(existing as never);
+  if (existing) {
+    const serialized = serializeLiveSession(existing as never);
+    if (existing.startedByUserId !== user.id || existing.provider !== "cloudflare-stream" || !existing.providerSessionId) return serialized;
+    try {
+      const realtime = await getRealtimeLiveInput(existing.providerSessionId);
+      return { ...serialized, publishUrl: realtime?.publishUrl ?? null, realtimeAvailable: Boolean(realtime) };
+    } catch (error) {
+      return { ...serialized, publishUrl: null, realtimeAvailable: false, realtimeError: error instanceof Error ? error.message : "Realtime video could not be resumed." };
+    }
+  }
 
   const sourceType = input.sourceType === "EXTERNAL_ENCODER" ? LiveSourceType.EXTERNAL_ENCODER : LiveSourceType.BROWSER_CAMERA;
   const createdAt = new Date();
+  let realtime: Awaited<ReturnType<typeof createRealtimeLiveInput>> = null;
+  let realtimeError: string | null = null;
+  try {
+    if (cloudflareStreamConfigured()) realtime = await createRealtimeLiveInput({ name: match.title, matchId: match.id, workspaceId: workspace.id });
+  } catch (error) {
+    realtimeError = error instanceof Error ? error.message : "Cloudflare Stream could not be started.";
+  }
   const created = await prisma.liveSession.create({
     data: {
       matchId,
@@ -96,11 +113,18 @@ export async function startLiveSession(matchId: string, input: Record<string, un
       status: LiveSessionStatus.LIVE,
       startedAt: createdAt,
       recordingStartedAt: createdAt,
-      playbackUrl: typeof input.playbackUrl === "string" && input.playbackUrl.trim() ? input.playbackUrl.trim() : null,
+      provider: realtime ? "cloudflare-stream" : "segment-dvr",
+      providerSessionId: realtime?.id ?? null,
+      playbackUrl: realtime?.playbackUrl ?? (typeof input.playbackUrl === "string" && input.playbackUrl.trim() ? input.playbackUrl.trim() : null),
     },
     include: liveSessionInclude,
   });
-  return serializeLiveSession(created as never);
+  return {
+    ...serializeLiveSession(created as never),
+    publishUrl: realtime?.publishUrl ?? null,
+    realtimeAvailable: Boolean(realtime),
+    realtimeError,
+  };
 }
 
 export async function stopLiveSession(matchId: string) {

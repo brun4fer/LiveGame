@@ -181,6 +181,8 @@ If using a capture card, select it as the camera source. Test audio and video be
 
 Live Game creates a `.webm` file named after the match and timestamp. At the same time, it creates short cloud replay segments so staff can rewind during the live event.
 
+When Cloudflare Stream is configured, **Start live** also publishes the same camera and audio through WebRTC. Staff accounts that open the same match automatically receive the live image. They do not need a camera connected to their own devices.
+
 The first replay segment normally becomes available after approximately five seconds. Recording continues when a user rewinds, pauses, reviews a clip or returns to live.
 
 ### Resume an existing live session
@@ -220,6 +222,8 @@ Keyboard controls work when the cursor is not inside an input field:
 - Configured moment shortcut: tag that moment type.
 
 The **LIVE** badge means you are watching the live edge. **REPLAY** shows how far behind live you are. The viewer counter shows staff currently connected to that session.
+
+At the live edge, remote staff watch the low-latency WebRTC transmission. Moving backwards switches that user to the R2 replay segments; **Go Live** reconnects that user to WebRTC. This switch does not affect the camera operator or other viewers.
 
 ## Tag and edit moments
 
@@ -501,5 +505,19 @@ This section is for the person deploying Live Game, not normal match-day users.
 - Expose `ETag`, `Content-Length`, `Content-Range` and `Accept-Ranges`.
 - Never expose R2 secret keys in browser-side variables.
 - Keep Live Game database credentials separate from unrelated applications unless sharing is explicitly intended.
+
+### Realtime camera sharing
+
+Realtime camera sharing uses Cloudflare Stream in addition to R2. R2 remains responsible for the rewindable segment archive; Stream distributes the current camera image through WebRTC.
+
+1. Enable Cloudflare Stream on the same Cloudflare account.
+2. Create an Account API Token with **Stream Write** permission.
+3. Add `CLOUDFLARE_STREAM_ACCOUNT_ID` to the local environment and Vercel.
+4. Add `CLOUDFLARE_STREAM_API_TOKEN` to the local environment and Vercel. This secret must never use a `NEXT_PUBLIC_` prefix.
+5. Set `CLOUDFLARE_STREAM_RECORDING_MODE` to `off` when R2 and the local file remain the recording sources, or `automatic` when an additional Stream recording is required.
+6. Optionally set `CLOUDFLARE_STREAM_ALLOWED_ORIGINS` to a comma-separated list of authorised hostnames.
+7. Redeploy Live Game after changing the variables.
+
+When Stream is unavailable or not configured, starting the match still preserves local recording and R2 replay. The operator receives a warning and remote staff continue with the delayed segment feed.
 
 Run `npm run r2:check` to verify R2 credentials without changing existing media. Run `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` before deployment.

@@ -10,6 +10,7 @@ import { MomentEditDialog } from "@/components/moment-edit-dialog";
 import { Badge, Button, Panel, Select } from "@/components/ui";
 import type { AccountPayload, LiveSegmentRecord, LiveSessionRecord, MatchDetail, MomentRecord, SettingsPayload } from "@/lib/domain";
 import { apiFetch } from "@/lib/http";
+import { closeWebRtcSession, publishCameraStream, receiveCameraStream, type BrowserWebRtcSession } from "@/lib/cloudflare-webrtc";
 import { getReplayEdge, locateReplayPosition } from "@/lib/live-replay";
 import { getMatchPeriodAtTime } from "@/lib/match-periods";
 import { formatTime, roundTime } from "@/lib/time";
@@ -69,7 +70,10 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const router = useRouter();
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const replayVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteLiveVideoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const publisherSessionRef = useRef<BrowserWebRtcSession | null>(null);
+  const viewerSessionRef = useRef<BrowserWebRtcSession | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingRef = useRef(false);
   const recorderTimerRef = useRef<number | null>(null);
@@ -92,6 +96,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState("");
   const [cameraConnected, setCameraConnected] = useState(false);
+  const [remoteLiveStream, setRemoteLiveStream] = useState<MediaStream | null>(null);
+  const [remotePlaybackNeedsAction, setRemotePlaybackNeedsAction] = useState(false);
+  const [realtimeConnecting, setRealtimeConnecting] = useState(false);
   const [recording, setRecording] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [localArchiveName, setLocalArchiveName] = useState<string | null>(null);
@@ -160,6 +167,10 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     if (recorderTimerRef.current !== null) window.clearTimeout(recorderTimerRef.current);
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
     if (archiveRecorderRef.current?.state === "recording") archiveRecorderRef.current.stop();
+    closeWebRtcSession(publisherSessionRef.current);
+    closeWebRtcSession(viewerSessionRef.current);
+    publisherSessionRef.current = null;
+    viewerSessionRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     for (const url of localSegmentUrlsRef.current.values()) URL.revokeObjectURL(url);
     localSegmentUrlsRef.current.clear();
@@ -179,6 +190,13 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     if (cameraVideoRef.current && streamRef.current) cameraVideoRef.current.srcObject = streamRef.current;
   }, [cameraConnected, atLiveEdge]);
 
+  useEffect(() => {
+    const video = remoteLiveVideoRef.current;
+    if (!video || !remoteLiveStream) return;
+    video.srcObject = remoteLiveStream;
+    void video.play().then(() => setRemotePlaybackNeedsAction(false)).catch(() => setRemotePlaybackNeedsAction(true));
+  }, [atLiveEdge, remoteLiveStream]);
+
   const readySegments = useMemo(
     () => session?.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl).sort((a, b) => a.sequence - b.sequence) || [],
     [session?.segments],
@@ -188,11 +206,77 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const liveEdgeSeconds = session?.status === "LIVE" && session.recordingStartedAt
     ? Math.max(availableEdgeSeconds, (clock - Date.parse(session.recordingStartedAt)) / 1000)
     : availableEdgeSeconds;
-  const currentTime = atLiveEdge && cameraConnected ? liveEdgeSeconds : playheadSeconds;
+  const currentTime = atLiveEdge && (cameraConnected || remoteLiveStream) ? liveEdgeSeconds : playheadSeconds;
   const activeLive = session?.status === "LIVE";
   const canStartCameraRecording = !activeLive || session?.startedBy.id === account?.id;
   const currentPeriod = match ? getMatchPeriodAtTime(match, currentTime) : null;
   const lastMoment = match?.moments.reduce<MomentRecord | null>((latest, moment) => !latest || Date.parse(moment.createdAt) > Date.parse(latest.createdAt) ? moment : latest, null) || null;
+
+  useEffect(() => {
+    const playbackUrl = session?.playbackUrl;
+    if (!activeLive || !atLiveEdge || cameraConnected || !playbackUrl) {
+      closeWebRtcSession(viewerSessionRef.current);
+      viewerSessionRef.current = null;
+      setRemoteLiveStream((current) => {
+        current?.getTracks().forEach((track) => track.stop());
+        return null;
+      });
+      setRealtimeConnecting(false);
+      setRemotePlaybackNeedsAction(false);
+      return;
+    }
+
+    let cancelled = false;
+    let retryTimer: number | null = null;
+
+    const disconnect = () => {
+      closeWebRtcSession(viewerSessionRef.current);
+      viewerSessionRef.current = null;
+      setRemoteLiveStream((current) => {
+        current?.getTracks().forEach((track) => track.stop());
+        return null;
+      });
+    };
+    const retry = () => {
+      if (!cancelled && retryTimer === null) retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        void connect();
+      }, 2_500);
+    };
+    const connect = async () => {
+      disconnect();
+      setRealtimeConnecting(true);
+      try {
+        const received = await receiveCameraStream(playbackUrl);
+        if (cancelled) {
+          received.stream.getTracks().forEach((track) => track.stop());
+          closeWebRtcSession(received);
+          return;
+        }
+        viewerSessionRef.current = received;
+        received.peer.onconnectionstatechange = () => {
+          if (!["failed", "closed"].includes(received.peer.connectionState) || cancelled || viewerSessionRef.current !== received) return;
+          disconnect();
+          retry();
+        };
+        setRemoteLiveStream(received.stream);
+        setRealtimeConnecting(false);
+      } catch {
+        if (!cancelled) {
+          setRealtimeConnecting(false);
+          retry();
+        }
+      }
+    };
+
+    void connect();
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      disconnect();
+      setRealtimeConnecting(false);
+    };
+  }, [activeLive, atLiveEdge, cameraConnected, session?.id, session?.playbackUrl]);
 
   useEffect(() => {
     const video = replayVideoRef.current;
@@ -267,20 +351,26 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const goLive = useCallback(() => {
     setPreviewEnd(null);
     setAtLiveEdge(true);
-    if (cameraConnected) {
+    if (cameraConnected || session?.playbackUrl) {
       setReplayTarget(null);
       setPlayheadSeconds(liveEdgeSeconds);
       setPlaying(true);
+      if (!cameraConnected && remoteLiveVideoRef.current) void remoteLiveVideoRef.current.play().catch(() => setRemotePlaybackNeedsAction(true));
       return;
     }
     const latest = readySegments.at(-1);
     if (latest) openSegment(latest, 0, true, true);
-  }, [cameraConnected, liveEdgeSeconds, openSegment, readySegments]);
+  }, [cameraConnected, liveEdgeSeconds, openSegment, readySegments, session?.playbackUrl]);
 
   const togglePlayback = useCallback(() => {
     setPreviewEnd(null);
-    if (atLiveEdge && cameraConnected) {
+    if (atLiveEdge && (cameraConnected || remoteLiveStream)) {
+      if (!cameraConnected && remoteLiveVideoRef.current?.paused) {
+        void remoteLiveVideoRef.current.play().catch(() => setRemotePlaybackNeedsAction(true));
+        return;
+      }
       if (availableEdgeSeconds > 0) seekVirtual(availableEdgeSeconds - 0.05, false);
+      else if (!cameraConnected) remoteLiveVideoRef.current?.pause();
       return;
     }
     const video = replayVideoRef.current;
@@ -291,7 +381,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     }
     const latest = readySegments.at(-1);
     if (latest) openSegment(latest, 0, true, false);
-  }, [atLiveEdge, availableEdgeSeconds, cameraConnected, openSegment, readySegments, seekVirtual]);
+  }, [atLiveEdge, availableEdgeSeconds, cameraConnected, openSegment, readySegments, remoteLiveStream, seekVirtual]);
 
   const markMoment = useCallback(async (momentTypeId: string) => {
     if (!session || session.status !== "LIVE") return setNotice("Wait for the live session to start before tagging a moment.");
@@ -432,6 +522,24 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     archiveFinalizedRef.current = null;
   }
 
+  async function startRealtimePublisher(activeSession: LiveSessionRecord) {
+    closeWebRtcSession(publisherSessionRef.current);
+    publisherSessionRef.current = null;
+    if (!activeSession.publishUrl) return activeSession.realtimeError || "Realtime camera sharing is not configured. Staff will use the delayed cloud replay.";
+    if (!streamRef.current) return "The camera stream is not available for realtime sharing.";
+    try {
+      const published = await publishCameraStream(streamRef.current, activeSession.publishUrl);
+      publisherSessionRef.current = published;
+      published.peer.onconnectionstatechange = () => {
+        if (!["failed", "disconnected"].includes(published.peer.connectionState) || publisherSessionRef.current !== published) return;
+        setNotice("Realtime camera sharing was interrupted. Local recording and cloud replay are still running.");
+      };
+      return null;
+    } catch (error) {
+      return `${error instanceof Error ? error.message : "Realtime camera sharing could not start."} Local recording and cloud replay are still available.`;
+    }
+  }
+
   async function startLive() {
     const directory = await chooseLocalRecordingFolder();
     if (!directory) return;
@@ -461,7 +569,10 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         return;
       }
       void recordNextSegment(next);
-      setNotice(`Live recording started. A local copy is being saved as ${archiveFileNameRef.current}.`);
+      const realtimeWarning = await startRealtimePublisher(next);
+      setNotice(realtimeWarning
+        ? `Live recording started. A local copy is being saved as ${archiveFileNameRef.current}. ${realtimeWarning}`
+        : `Live recording started and is now shared with the staff. A local copy is being saved as ${archiveFileNameRef.current}.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The live session could not be started.");
     }
@@ -551,6 +662,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     if (recorderTimerRef.current !== null) window.clearTimeout(recorderTimerRef.current);
     const recorder = recorderRef.current;
     if (recorder?.state === "recording") await new Promise<void>((resolve) => { recorder.addEventListener("stop", () => resolve(), { once: true }); recorder.stop(); });
+    closeWebRtcSession(publisherSessionRef.current);
+    publisherSessionRef.current = null;
     const finalizationResults = await Promise.allSettled([stopLocalArchive(), ...pendingUploadsRef.current]);
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
@@ -680,6 +793,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const timelineDuration = Math.max(1, liveEdgeSeconds, ...match.moments.map((moment) => moment.endTimeSeconds));
   const canReplay = readySegments.length > 0;
   const behindLive = activeLive ? Math.max(0, liveEdgeSeconds - currentTime) : 0;
+  const showingRemoteLive = Boolean(activeLive && atLiveEdge && !cameraConnected && remoteLiveStream);
 
   return <div className="flex min-h-0 flex-col gap-2 xl:h-[calc(100dvh-6.5rem)] xl:overflow-hidden">
     <Panel className="flex shrink-0 items-stretch overflow-hidden">
@@ -704,7 +818,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     <div className="grid min-h-0 flex-1 items-stretch gap-2 xl:grid-cols-[18rem_minmax(0,1fr)]">
       <Panel className="order-2 flex min-h-0 min-w-0 flex-col overflow-hidden">
         <div className="relative aspect-video min-h-72 shrink-0 bg-black xl:aspect-auto xl:min-h-0 xl:flex-1">
-          {atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{activeLive ? "Waiting for the first replay segment" : "Connect the match camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">Recording continues while every staff member controls an independent replay.</p></div>}
+          {atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : "Connect the match camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">Recording continues while every staff member controls an independent replay.</p></div>}
+          {showingRemoteLive && remotePlaybackNeedsAction ? <button type="button" onClick={() => void remoteLiveVideoRef.current?.play()} className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm font-semibold text-white"><span className="rounded-lg border border-cyan-300/35 bg-pitch-950/90 px-4 py-3"><Play size={16} className="mr-2 inline" />Start live video</span></button> : null}
           {activeLive ? <span className="absolute left-3 top-3 rounded-md bg-red-600 px-2 py-1 text-[10px] font-bold text-white">● RECORDING</span> : null}
           {activeLive ? <span className={`absolute right-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold ${atLiveEdge ? "bg-cyan-300 text-slate-950" : "bg-slate-900/85 text-cyan-100"}`}>{atLiveEdge ? "LIVE" : `REPLAY · ${formatTime(behindLive)} behind`}</span> : null}
         </div>
@@ -714,7 +829,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
             <div className="min-w-0 flex-1 overflow-x-auto"><div className="flex min-w-max items-center gap-1">
               <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Back 15 seconds" onClick={() => seekBy(-15)}><ChevronsLeft size={15} /></Button>
               <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Back 5 seconds (left arrow)" onClick={() => seekBy(-5)}><RotateCcw size={15} /></Button>
-              <Button size="icon" className="h-8 w-8" variant="primary" disabled={!canReplay} title="Play or pause (space)" onClick={togglePlayback}>{playing && !(atLiveEdge && cameraConnected) ? <Pause size={15} /> : <Play size={15} />}</Button>
+              <Button size="icon" className="h-8 w-8" variant="primary" disabled={!canReplay && !showingRemoteLive} title="Play or pause (space)" onClick={togglePlayback}>{playing && !(atLiveEdge && cameraConnected) ? <Pause size={15} /> : <Play size={15} />}</Button>
               <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Forward 5 seconds (right arrow)" onClick={() => seekBy(5)}><ChevronsRight size={15} /></Button>
               <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Forward 15 seconds" onClick={() => seekBy(15)}><ChevronsRight size={15} className="scale-125" /></Button>
               <div className="flex overflow-hidden rounded-md border border-white/10">{[1, 2, 4].map((rate) => <button key={rate} type="button" onClick={() => setRate(rate)} className={`h-8 px-2 text-[10px] font-semibold transition ${playbackRate === rate ? "bg-cyan-300 text-slate-950" : "bg-white/[.04] text-slate-300 hover:bg-white/[.1]"}`}>{rate}×</button>)}</div>

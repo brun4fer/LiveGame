@@ -84,6 +84,9 @@ export type LiveSessionRecord = {
   lastSegmentAt: string | null;
   startedBy: { id: string; name: string; username: string };
   segments: LiveSegmentRecord[];
+  publishUrl?: string | null;
+  realtimeAvailable?: boolean;
+  realtimeError?: string | null;
 };
 
 export type PlaylistRecord = {
