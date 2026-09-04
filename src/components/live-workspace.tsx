@@ -555,7 +555,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   async function startRealtimePublisher(activeSession: LiveSessionRecord) {
     closeWebRtcSession(publisherSessionRef.current);
     publisherSessionRef.current = null;
-    if (!activeSession.publishUrl) return activeSession.realtimeError || null;
+    if (!activeSession.publishUrl) return null;
     if (!streamRef.current) return "The camera stream is not available for realtime sharing.";
     try {
       const published = await publishCameraStream(streamRef.current, activeSession.publishUrl);
@@ -679,7 +679,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
           throw uploadError;
         }
       }).catch((error) => {
-        setNotice(`${error instanceof Error ? error.message : `Cloud replay segment ${sequence + 1} failed.`} Local replay and recording are still running.`);
+        console.warn(`Cloud replay segment ${sequence + 1} was not uploaded. Local replay and recording continue.`, error);
       });
       pendingUploadsRef.current.add(upload);
       void upload.finally(() => pendingUploadsRef.current.delete(upload));

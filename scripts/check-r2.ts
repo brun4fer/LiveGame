@@ -29,16 +29,34 @@ async function curlRequest(method: "PUT" | "DELETE", url: string) {
   }
 }
 
+async function checkCors(url: string, origin: string) {
+  const { stdout } = await run("curl.exe", [
+    "--silent", "--show-error", "--request", "OPTIONS",
+    "--header", `Origin: ${origin}`,
+    "--header", "Access-Control-Request-Method: PUT",
+    "--header", "Access-Control-Request-Headers: content-type",
+    "--dump-header", "-", "--output", "NUL", url,
+  ]);
+  const allowedOrigin = stdout.match(/^access-control-allow-origin:\s*(.+)$/im)?.[1]?.trim();
+  const allowedMethods = stdout.match(/^access-control-allow-methods:\s*(.+)$/im)?.[1]?.trim() || "";
+  if (allowedOrigin !== origin || !allowedMethods.toUpperCase().includes("PUT")) {
+    throw new Error(`Cloudflare R2 CORS does not allow ${origin} to upload video.`);
+  }
+  console.log(`R2 CORS allows uploads from ${origin}.`);
+}
+
 async function main() {
   const { abortMultipartUpload, createMultipartUpload, createObjectDeleteUrl, createObjectUploadUrl } = await import("../src/lib/r2");
   const key = `healthchecks/${randomUUID()}`;
+  const objectUploadUrl = createObjectUploadUrl(key);
+  await checkCors(objectUploadUrl, "http://localhost:3000");
   let uploadId: string | null = null;
   try {
     uploadId = await createMultipartUpload(key, "application/octet-stream");
   } catch (error) {
     const cause = error instanceof Error && "cause" in error ? error.cause as { code?: string } | undefined : undefined;
     if (cause?.code !== "UNABLE_TO_VERIFY_LEAF_SIGNATURE" || process.platform !== "win32") throw error;
-    await curlRequest("PUT", createObjectUploadUrl(key));
+    await curlRequest("PUT", objectUploadUrl);
     await curlRequest("DELETE", createObjectDeleteUrl(key));
     console.log("R2 signed upload/delete passed using the Windows certificate store.");
     return;
@@ -53,4 +71,3 @@ main().catch((error) => {
   console.error([error instanceof Error ? error.message : String(error), cause?.code, cause?.message].filter(Boolean).join(" · "));
   process.exitCode = 1;
 });
-
