@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Loader2, Pause, Pencil, Play, Radio, RotateCcw, Settings2, Trash2, Users, Video, X } from "lucide-react";
+import { ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Loader2, Pause, Pencil, Play, Radio, RotateCcw, Settings2, Trash2, Upload, Users, Video, X } from "lucide-react";
 
 import { MatchEditDialog } from "@/components/match-edit-dialog";
 import { MomentEditDialog } from "@/components/moment-edit-dialog";
@@ -13,6 +13,7 @@ import { apiFetch } from "@/lib/http";
 import { closeWebRtcSession, publishCameraStream, receiveCameraStream, type BrowserWebRtcSession } from "@/lib/cloudflare-webrtc";
 import { getReplayEdge, locateReplayPosition } from "@/lib/live-replay";
 import { getMatchPeriodAtTime } from "@/lib/match-periods";
+import { uploadMatchVideo } from "@/lib/remote-video-store";
 import { formatTime, roundTime } from "@/lib/time";
 
 const SEGMENT_MILLISECONDS = 5_000;
@@ -22,7 +23,7 @@ type LiveViewer = { user: { id: string; name: string; username: string }; atLive
 type ReplayTarget = { segmentId: string; offsetSeconds: number; autoplay: boolean; command: number };
 type PeriodMarkerKey = "firstHalfStartSeconds" | "firstHalfEndSeconds" | "secondHalfStartSeconds" | "secondHalfEndSeconds";
 type LocalWritableFile = { write(data: Blob): Promise<void>; close(): Promise<void>; abort?(): Promise<void> };
-type LocalFileHandle = { name: string; createWritable(): Promise<LocalWritableFile> };
+type LocalFileHandle = { name: string; createWritable(): Promise<LocalWritableFile>; getFile(): Promise<File> };
 type LocalDirectoryHandle = { getFileHandle(name: string, options: { create: true }): Promise<LocalFileHandle> };
 
 const periodMarkers: Array<[PeriodMarkerKey, string]> = [
@@ -48,15 +49,25 @@ function presenceClientId() {
   return created;
 }
 
-function supportedMimeType() {
+function supportedSegmentMimeType() {
   const options = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"];
   return options.find((type) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(type)) || "video/webm";
+}
+
+function supportedArchiveMimeType() {
+  const options = [
+    "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+    "video/mp4;codecs=avc1,mp4a.40.2",
+    "video/mp4;codecs=h264,aac",
+    "video/mp4",
+  ];
+  return options.find((type) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(type)) || null;
 }
 
 function localRecordingFileName(title: string) {
   const safeTitle = title.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "live-game";
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return `${safeTitle}-${timestamp}.webm`;
+  return `${safeTitle}-${timestamp}.mp4`;
 }
 
 function mergeLiveSession(current: LiveSessionRecord | null, next: LiveSessionRecord | null) {
@@ -82,8 +93,11 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const archiveWriteChainRef = useRef<Promise<void>>(Promise.resolve());
   const archiveFinalizedRef = useRef<Promise<void> | null>(null);
   const archiveFileNameRef = useRef<string | null>(null);
+  const archiveFileHandleRef = useRef<LocalFileHandle | null>(null);
   const localSegmentUrlsRef = useRef(new Map<number, string>());
   const sequenceRef = useRef(0);
+  const segmentTimelineCursorRef = useRef(0);
+  const segmentStartedAtClockRef = useRef(0);
   const fetchedSequenceRef = useRef(-1);
   const replayCommandRef = useRef(0);
   const pendingUploadsRef = useRef(new Set<Promise<void>>());
@@ -100,8 +114,13 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [remotePlaybackNeedsAction, setRemotePlaybackNeedsAction] = useState(false);
   const [realtimeConnecting, setRealtimeConnecting] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [pausing, setPausing] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [localArchiveName, setLocalArchiveName] = useState<string | null>(null);
+  const [completedRecordingFile, setCompletedRecordingFile] = useState<File | null>(null);
+  const [uploadingRecording, setUploadingRecording] = useState(false);
+  const [recordingUploadProgress, setRecordingUploadProgress] = useState(0);
   const [atLiveEdge, setAtLiveEdge] = useState(true);
   const [replayTarget, setReplayTarget] = useState<ReplayTarget | null>(null);
   const [playheadSeconds, setPlayheadSeconds] = useState(0);
@@ -166,7 +185,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     recordingRef.current = false;
     if (recorderTimerRef.current !== null) window.clearTimeout(recorderTimerRef.current);
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
-    if (archiveRecorderRef.current?.state === "recording") archiveRecorderRef.current.stop();
+    if (archiveRecorderRef.current && archiveRecorderRef.current.state !== "inactive") archiveRecorderRef.current.stop();
     closeWebRtcSession(publisherSessionRef.current);
     closeWebRtcSession(viewerSessionRef.current);
     publisherSessionRef.current = null;
@@ -177,14 +196,14 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   }, []);
 
   useEffect(() => {
-    if (!recording && !stopping) return;
+    if (!recording && !paused && !stopping) return;
     const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
       event.preventDefault();
       event.returnValue = "";
     };
     window.addEventListener("beforeunload", warnBeforeLeaving);
     return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
-  }, [recording, stopping]);
+  }, [paused, recording, stopping]);
 
   useEffect(() => {
     if (cameraVideoRef.current && streamRef.current) cameraVideoRef.current.srcObject = streamRef.current;
@@ -203,9 +222,10 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   );
   const selectedSegment = readySegments.find((segment) => segment.id === replayTarget?.segmentId) || null;
   const availableEdgeSeconds = getReplayEdge(readySegments);
-  const liveEdgeSeconds = session?.status === "LIVE" && session.recordingStartedAt
-    ? Math.max(availableEdgeSeconds, (clock - Date.parse(session.recordingStartedAt)) / 1000)
-    : availableEdgeSeconds;
+  const activeSegmentSeconds = recording && segmentStartedAtClockRef.current
+    ? Math.max(0, (clock - segmentStartedAtClockRef.current) / 1000)
+    : 0;
+  const liveEdgeSeconds = Math.max(availableEdgeSeconds, segmentTimelineCursorRef.current + activeSegmentSeconds);
   const currentTime = atLiveEdge && (cameraConnected || remoteLiveStream) ? liveEdgeSeconds : playheadSeconds;
   const activeLive = session?.status === "LIVE";
   const canStartCameraRecording = !activeLive || session?.startedBy.id === account?.id;
@@ -385,7 +405,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
   const markMoment = useCallback(async (momentTypeId: string) => {
     if (!session || session.status !== "LIVE") return setNotice("Wait for the live session to start before tagging a moment.");
-    const markedAtSeconds = atLiveEdge && session.recordingStartedAt ? (Date.now() - Date.parse(session.recordingStartedAt)) / 1000 : playheadSeconds;
+    if (paused) return setNotice("Resume recording before tagging a new moment.");
+    const markedAtSeconds = atLiveEdge ? liveEdgeSeconds : playheadSeconds;
     setBusyMomentTypeId(momentTypeId);
     try {
       const saved = await apiFetch<MomentRecord>(`/api/matches/${matchId}/live/moments`, {
@@ -400,7 +421,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     } finally {
       setBusyMomentTypeId(null);
     }
-  }, [atLiveEdge, matchId, playheadSeconds, session]);
+  }, [atLiveEdge, liveEdgeSeconds, matchId, paused, playheadSeconds, session]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -473,7 +494,11 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     const fileName = localRecordingFileName(match.title);
     const fileHandle = await directory.getFileHandle(fileName, { create: true });
     const writer = await fileHandle.createWritable();
-    const mimeType = supportedMimeType();
+    const mimeType = supportedArchiveMimeType();
+    if (!mimeType) {
+      await writer.abort?.().catch(() => undefined);
+      throw new Error("This browser cannot record the complete match as MP4. Update Chrome or Edge and try again.");
+    }
     let archiveRecorder: MediaRecorder;
     try {
       archiveRecorder = new MediaRecorder(streamRef.current, { mimeType, videoBitsPerSecond: 8_000_000, audioBitsPerSecond: 128_000 });
@@ -484,6 +509,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
     archiveWriterRef.current = writer;
     archiveRecorderRef.current = archiveRecorder;
+    archiveFileHandleRef.current = fileHandle;
     archiveWriteChainRef.current = Promise.resolve();
     archiveFileNameRef.current = fileName;
     setLocalArchiveName(fileName);
@@ -517,9 +543,12 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   async function stopLocalArchive() {
     const archiveRecorder = archiveRecorderRef.current;
     const finalization = archiveFinalizedRef.current;
-    if (archiveRecorder?.state === "recording") archiveRecorder.stop();
+    if (archiveRecorder && archiveRecorder.state !== "inactive") archiveRecorder.stop();
     if (finalization) await finalization;
     archiveFinalizedRef.current = null;
+    const completed = await archiveFileHandleRef.current?.getFile();
+    if (completed) setCompletedRecordingFile(completed);
+    return completed || null;
   }
 
   async function startRealtimePublisher(activeSession: LiveSessionRecord) {
@@ -554,8 +583,12 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       setSession(next);
       sequenceRef.current = Math.max(...next.segments.map((segment) => segment.sequence + 1), 0);
       fetchedSequenceRef.current = Math.max(...next.segments.map((segment) => segment.sequence), -1);
+      segmentTimelineCursorRef.current = getReplayEdge(next.segments.filter((segment) => segment.status === "READY"));
+      segmentStartedAtClockRef.current = Date.now();
       recordingRef.current = true;
       setRecording(true);
+      setPaused(false);
+      setCompletedRecordingFile(null);
       setAtLiveEdge(true);
       setReplayTarget(null);
       try {
@@ -581,9 +614,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   async function recordNextSegment(activeSession: LiveSessionRecord) {
     if (!recordingRef.current || !streamRef.current) return;
     const sequence = sequenceRef.current++;
-    const recordingStart = activeSession.recordingStartedAt ? Date.parse(activeSession.recordingStartedAt) : Date.now();
-    const startedAtSeconds = Math.max(0, (Date.now() - recordingStart) / 1000);
-    const mimeType = supportedMimeType();
+    const startedAtSeconds = segmentTimelineCursorRef.current;
+    segmentStartedAtClockRef.current = Date.now();
+    const mimeType = supportedSegmentMimeType();
     const preparation = apiFetch<PreparedSegment>(`/api/live-sessions/${activeSession.id}/segments`, {
       method: "POST",
       body: JSON.stringify({ sequence, startedAtSeconds, mimeType }),
@@ -595,6 +628,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
     recorder.onstop = () => {
       const durationSeconds = Math.max(0.1, (performance.now() - startedAt) / 1000);
+      segmentTimelineCursorRef.current = Math.max(segmentTimelineCursorRef.current, startedAtSeconds + durationSeconds);
+      segmentStartedAtClockRef.current = 0;
       const blob = new Blob(chunks, { type: mimeType });
       // Begin the next independent recording immediately. Preparing and uploading
       // this completed segment must never introduce a gap in the camera capture.
@@ -655,10 +690,106 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     return saved;
   }
 
+  async function pauseRecording() {
+    if (!recording || pausing || stopping) return;
+    setPausing(true);
+    recordingRef.current = false;
+    setRecording(false);
+    if (recorderTimerRef.current !== null) {
+      window.clearTimeout(recorderTimerRef.current);
+      recorderTimerRef.current = null;
+    }
+    try {
+      const archiveRecorder = archiveRecorderRef.current;
+      if (!archiveRecorder || archiveRecorder.state !== "recording") throw new Error("The complete match recording is not available to pause.");
+      const archivePaused = new Promise<void>((resolve) => archiveRecorder.addEventListener("pause", () => resolve(), { once: true }));
+      archiveRecorder.requestData();
+      archiveRecorder.pause();
+      const segmentRecorder = recorderRef.current;
+      if (segmentRecorder?.state === "recording") {
+        await new Promise<void>((resolve) => {
+          segmentRecorder.addEventListener("stop", () => resolve(), { once: true });
+          segmentRecorder.stop();
+        });
+      }
+      await archivePaused;
+      await archiveWriteChainRef.current;
+      closeWebRtcSession(publisherSessionRef.current);
+      publisherSessionRef.current = null;
+      setPaused(true);
+      setAtLiveEdge(true);
+      setPlayheadSeconds(segmentTimelineCursorRef.current);
+      setNotice(`Recording paused at ${formatTime(segmentTimelineCursorRef.current)}. The interval will not be included in the MP4.`);
+    } catch (error) {
+      const archiveState = archiveRecorderRef.current?.state;
+      if (archiveState === "recording" && session) {
+        recordingRef.current = true;
+        setRecording(true);
+        if (!recorderRef.current || recorderRef.current.state === "inactive") void recordNextSegment(session);
+      } else {
+        recordingRef.current = false;
+        setRecording(false);
+        setPaused(archiveState === "paused");
+      }
+      setNotice(error instanceof Error ? error.message : "The recording could not be paused.");
+    } finally {
+      setPausing(false);
+    }
+  }
+
+  async function resumeRecording() {
+    if (!paused || !session || pausing || stopping) return;
+    const archiveRecorder = archiveRecorderRef.current;
+    if (!archiveRecorder || archiveRecorder.state !== "paused" || !streamRef.current) {
+      setNotice("This recording can no longer be resumed. End the live session and start a new recording file.");
+      return;
+    }
+    try {
+      const resumed = new Promise<void>((resolve) => archiveRecorder.addEventListener("resume", () => resolve(), { once: true }));
+      archiveRecorder.resume();
+      await resumed;
+      recordingRef.current = true;
+      segmentStartedAtClockRef.current = Date.now();
+      setRecording(true);
+      setPaused(false);
+      setAtLiveEdge(true);
+      setReplayTarget(null);
+      void recordNextSegment(session);
+      const realtimeWarning = await startRealtimePublisher(session);
+      setNotice(realtimeWarning
+        ? `Recording resumed at ${formatTime(segmentTimelineCursorRef.current)}. ${realtimeWarning}`
+        : `Recording resumed at ${formatTime(segmentTimelineCursorRef.current)} in the same MP4 file.`);
+    } catch (error) {
+      recordingRef.current = false;
+      setRecording(false);
+      setNotice(error instanceof Error ? error.message : "The recording could not be resumed.");
+    }
+  }
+
+  async function uploadFullRecording() {
+    if (!completedRecordingFile || uploadingRecording) return;
+    setUploadingRecording(true);
+    setRecordingUploadProgress(0);
+    try {
+      const result = await uploadMatchVideo(matchId, completedRecordingFile, ({ progress, detail }) => {
+        setRecordingUploadProgress(progress);
+        setNotice(`${detail} ${Math.round(progress * 100)}%`);
+      });
+      const savedMatch = await apiFetch<MatchDetail>(`/api/matches/${matchId}`);
+      setMatch(savedMatch);
+      setNotice(result.resumed ? "The complete match upload resumed and finished successfully." : "The complete match video was uploaded successfully.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The complete match video could not be uploaded.");
+    } finally {
+      setUploadingRecording(false);
+    }
+  }
+
   async function stopLive() {
     setStopping(true);
     recordingRef.current = false;
     setRecording(false);
+    setPaused(false);
     if (recorderTimerRef.current !== null) window.clearTimeout(recorderTimerRef.current);
     const recorder = recorderRef.current;
     if (recorder?.state === "recording") await new Promise<void>((resolve) => { recorder.addEventListener("stop", () => resolve(), { once: true }); recorder.stop(); });
@@ -796,20 +927,20 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const showingRemoteLive = Boolean(activeLive && atLiveEdge && !cameraConnected && remoteLiveStream);
 
   return <div className="flex min-h-0 flex-col gap-2 xl:h-[calc(100dvh-6.5rem)] xl:overflow-hidden">
-    <Panel className="flex shrink-0 items-stretch overflow-hidden">
-      <div className="flex shrink-0 items-center gap-1 border-r border-white/10 px-2">
+    <Panel className="flex shrink-0 flex-wrap items-stretch overflow-hidden md:flex-nowrap">
+      <div className="flex shrink-0 items-center gap-1 border-r border-white/10 px-2 max-md:w-full max-md:border-b max-md:border-r-0">
         <Link href="/" className="inline-flex h-8 items-center gap-1 rounded-md px-2 text-[10px] font-semibold text-slate-400 hover:bg-white/[.06] hover:text-white"><ArrowLeft size={12} />Matches</Link>
         <Badge className="max-w-44 truncate border-cyan-300/25 bg-cyan-300/10 text-[10px] text-cyan-100" title={match.title}>Live: {match.title}</Badge>
         <button type="button" title="Edit match" aria-label="Edit match" onClick={() => setEditingMatch(true)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-white/[.06] hover:text-white"><Settings2 size={13} /></button>
       </div>
-      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto px-2 py-1.5" aria-label="Tag the previous 20 seconds">
-        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; return <button key={type.id} type="button" disabled={!activeLive || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 min-w-[6rem] shrink-0 items-center justify-between gap-2 rounded-md border px-2 text-left transition ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0"><span className="block truncate text-[9px] font-bold" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 block text-[8px] text-slate-600">{busy ? "Saving…" : "Previous 20s"}</span></span><kbd className="rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300">{type.defaultShortcut || "—"}</kbd></button>; })}
+      <div className="order-3 flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto px-2 py-1.5 md:order-none" aria-label="Tag the previous 20 seconds">
+        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; return <button key={type.id} type="button" disabled={!activeLive || paused || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 min-w-[6rem] shrink-0 items-center justify-between gap-2 rounded-md border px-2 text-left transition ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0"><span className="block truncate text-[9px] font-bold" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 block text-[8px] text-slate-600">{busy ? "Saving…" : paused ? "Recording paused" : "Previous 20s"}</span></span><kbd className="rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300">{type.defaultShortcut || "—"}</kbd></button>; })}
       </div>
-      <div className="flex shrink-0 items-center gap-1 border-l border-white/10 px-1.5">
-        <Select aria-label="Camera" title="Camera" className="hidden h-8 w-36 py-0 text-[10px] 2xl:block" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} disabled={recording}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
-        {(recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : null}
-        <Button size="icon" className="h-8 w-8" title={cameraConnected ? "Reconnect camera" : "Connect camera"} onClick={() => void connectCamera()} disabled={recording}><Camera size={13} /></Button>
-        {!recording && !stopping ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording}><Radio size={12} />{activeLive ? canStartCameraRecording ? "Resume recording" : "Live running" : "Start live"}</Button> : <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End live"}</Button>}
+      <div className="ml-auto flex min-w-0 shrink-0 items-center justify-end gap-1 border-l border-white/10 px-1.5 max-md:w-full max-md:border-b max-md:border-l-0">
+        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-36 sm:flex-none" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} disabled={recording || paused}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
+        {(recording || paused || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : paused ? "Paused" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : paused ? "File paused" : "Local copy"}</Badge> : null}
+        <Button size="icon" className="h-8 w-8" title={cameraConnected ? "Reconnect camera" : "Connect camera"} onClick={() => void connectCamera()} disabled={recording || paused}><Camera size={13} /></Button>
+        {!activeLive ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping || uploadingRecording}><Radio size={12} />Start live</Button>{completedRecordingFile ? <Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void uploadFullRecording()} disabled={uploadingRecording}>{uploadingRecording ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />}{uploadingRecording ? `Uploading ${Math.round(recordingUploadProgress * 100)}%` : "Upload full video"}</Button> : null}</> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Pausing…" : "Pause"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End live"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Resume</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End live"}</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || stopping}><Radio size={12} />{canStartCameraRecording ? "Resume in new file" : "Live running"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || stopping}><CircleStop size={12} />End live</Button></>}
       </div>
     </Panel>
 
@@ -820,7 +951,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         <div className="relative aspect-video min-h-72 shrink-0 bg-black xl:aspect-auto xl:min-h-0 xl:flex-1">
           {atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : "Connect the match camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">Recording continues while every staff member controls an independent replay.</p></div>}
           {showingRemoteLive && remotePlaybackNeedsAction ? <button type="button" onClick={() => void remoteLiveVideoRef.current?.play()} className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm font-semibold text-white"><span className="rounded-lg border border-cyan-300/35 bg-pitch-950/90 px-4 py-3"><Play size={16} className="mr-2 inline" />Start live video</span></button> : null}
-          {activeLive ? <span className="absolute left-3 top-3 rounded-md bg-red-600 px-2 py-1 text-[10px] font-bold text-white">● RECORDING</span> : null}
+          {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${paused ? "bg-amber-600" : "bg-red-600"}`}>{paused ? "Ⅱ PAUSED" : "● RECORDING"}</span> : null}
           {activeLive ? <span className={`absolute right-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold ${atLiveEdge ? "bg-cyan-300 text-slate-950" : "bg-slate-900/85 text-cyan-100"}`}>{atLiveEdge ? "LIVE" : `REPLAY · ${formatTime(behindLive)} behind`}</span> : null}
         </div>
         <div className="shrink-0 border-t border-white/10 bg-pitch-950/90 p-2">
@@ -845,7 +976,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
       <Panel className="order-1 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
         <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Tagged moments</p><p className="mt-1 text-xs text-slate-400">{match.moments.length} in the recording</p></div><Badge title={liveViewers.map((viewer) => `${viewer.user.name} · ${viewer.atLiveEdge ? "live" : "replay"}`).join("\n")}><Users size={11} className="mr-1" />{liveViewers.length || (account ? 1 : 0)}</Badge></div><p className="mt-2 text-[10px] leading-4 text-slate-500">Select a row to review it without stopping the recording.</p></div>
-        <div className="min-h-0 flex-1 overflow-y-auto">{match.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Tagged moments will appear here.</p> : match.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full items-center gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}${moment.createdBy ? ` · ${moment.createdBy.name}` : ""}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button><button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] text-cyan-100" onClick={() => setEditingMoment(moment)}><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removeMoment(moment)}><Trash2 size={11} />Delete</button></div>)}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto">{match.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Tagged moments will appear here.</p> : match.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}${moment.createdBy ? ` · ${moment.createdBy.name}` : ""}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button><button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] text-cyan-100" onClick={() => setEditingMoment(moment)}><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removeMoment(moment)}><Trash2 size={11} />Delete</button>{moment.notes ? <p className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] leading-4 text-amber-200">{moment.notes}</p> : null}</div>)}</div>
       </Panel>
     </div>
 

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Archive, ArrowLeft, Check, ChevronsLeft, ChevronsRight, Clock3, Cloud, FileVideo, Loader2, Pause, Pencil, Play, RotateCcw, Settings2, Trash2, Upload, X } from "lucide-react";
+import { Archive, ArrowLeft, Check, ChevronsLeft, ChevronsRight, Clock3, Cloud, Download, FileVideo, Loader2, Pause, Pencil, Play, RotateCcw, Settings2, Trash2, Upload, X } from "lucide-react";
 
 import { CloudVideoLibrary } from "@/components/cloud-video-library";
 import { MatchEditDialog } from "@/components/match-edit-dialog";
@@ -11,6 +11,7 @@ import { MomentEditDialog } from "@/components/moment-edit-dialog";
 import { Badge, Button, Panel } from "@/components/ui";
 import type { AccountPayload, MatchDetail, MomentRecord, MomentTypeRecord, SettingsPayload } from "@/lib/domain";
 import { isExportPickerCancellation, pickExportDirectory, writeBlobToDirectory } from "@/lib/export-directory";
+import { isFilePickerCancellation, saveFullVideo } from "@/lib/full-video-download";
 import { apiFetch } from "@/lib/http";
 import { getRememberedMatchVideo, rememberMatchVideo } from "@/lib/local-video-store";
 import { getMatchPeriodAtTime } from "@/lib/match-periods";
@@ -64,6 +65,7 @@ export function AnalysisWorkspace({ matchId }: { matchId: string }) {
   const [exportStatus, setExportStatus] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [downloadingVideo, setDownloadingVideo] = useState(false);
   const [showCloudLibrary, setShowCloudLibrary] = useState(false);
   const [cloudAssets, setCloudAssets] = useState<CloudVideoAsset[]>([]);
   const [loadingCloudLibrary, setLoadingCloudLibrary] = useState(false);
@@ -139,6 +141,26 @@ export function AnalysisWorkspace({ matchId }: { matchId: string }) {
 
   function cancelUpload() {
     uploadAbortRef.current?.abort();
+  }
+
+  async function downloadFullVideo() {
+    if (!match?.video || downloadingVideo) return;
+    setDownloadingVideo(true);
+    try {
+      const localFile = sourceFileRef.current;
+      await saveFullVideo({
+        file: localFile,
+        resolveRemoteUrl: !localFile && match.video.storageStatus === "READY" ? async () => (await getRemoteVideoUrl(matchId)).url : undefined,
+        fileName: localFile?.name || match.video.fileName,
+        mimeType: localFile?.type || match.video.mimeType,
+        onProgress: (progress) => setNotice(progress === null ? "Downloading the complete match video…" : `Downloading the complete match video… ${Math.round(progress * 100)}%`),
+      });
+      setNotice("Complete match video saved successfully.");
+    } catch (error) {
+      if (!isFilePickerCancellation(error)) setNotice(error instanceof Error ? error.message : "The complete match video could not be downloaded.");
+    } finally {
+      setDownloadingVideo(false);
+    }
   }
 
   async function openCloudLibrary() {
@@ -490,14 +512,14 @@ export function AnalysisWorkspace({ matchId }: { matchId: string }) {
               </div>
               <form className="ml-1 flex items-center gap-1 border-l border-white/10 pl-2" onSubmit={(event) => { event.preventDefault(); goToExactTime(); }}><input aria-label="Exact second" className="h-8 w-20 rounded-md border border-white/10 bg-black/20 px-2 font-mono text-[10px] text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50" type="number" min="0" max={duration || undefined} step="0.1" placeholder="Second" value={seekTime} onChange={(event) => setSeekTime(event.target.value)} disabled={!sourceUrl} /><Button type="submit" size="sm" className="h-8 px-2 text-[10px]" variant="secondary" disabled={!sourceUrl || seekTime === ""}>Go</Button></form>
             </div></div>
-            <div className="flex shrink-0 items-center gap-2"><span className="hidden items-center gap-1 font-mono text-xs text-white sm:inline-flex"><Clock3 size={13} className="text-cyan-200" />{formatTime(currentTime)} / {formatTime(duration)}</span><Link href={`/analysis/${matchId}/submoments`}><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" disabled={match.moments.length === 0 || activeMoments.length > 0}>Identify submoments <ChevronsRight size={13} /></Button></Link></div>
+            <div className="flex shrink-0 items-center gap-1"><span className="hidden items-center gap-1 font-mono text-xs text-white sm:inline-flex"><Clock3 size={13} className="text-cyan-200" />{formatTime(currentTime)} / {formatTime(duration)}</span><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => fileInputRef.current?.click()} disabled={uploading}><Upload size={12} />Upload video</Button><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void downloadFullVideo()} disabled={!match.video || downloadingVideo}>{downloadingVideo ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}Download full video</Button><Link href={`/analysis/${matchId}/submoments`}><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" disabled={match.moments.length === 0 || activeMoments.length > 0}>Identify submoments <ChevronsRight size={13} /></Button></Link></div>
           </div>
         </div>
       </Panel>
 
       <Panel className="order-1 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
         <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Tagged moments</p><p className="mt-1 text-xs text-slate-400">{match.moments.length} in the video</p></div><Button size="sm" variant="secondary" className="shrink-0 px-2" disabled={match.moments.length === 0 || exporting} title={exporting ? exportStatus : "Export all tagged moments"} onClick={() => void exportAllMoments()}>{exporting ? <Loader2 size={14} className="animate-spin" /> : <Archive size={14} />}{exporting ? "Exporting" : "Export all"}</Button></div>{exporting && exportStatus ? <p className="mt-2 text-[10px] leading-4 text-cyan-100">{exportStatus}</p> : <p className="mt-2 text-[10px] leading-4 text-slate-500">Select a row to review or export.</p>}</div>
-        <div className="min-h-0 flex-1 overflow-y-auto">{match.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Completed moments appear here.</p> : match.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full items-center gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border transition ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button><button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border transition ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] font-medium text-cyan-100 hover:bg-cyan-300/20" onClick={() => setEditingMoment(moment)} aria-label="Edit moment"><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] font-medium text-red-100 hover:bg-red-500/25" onClick={() => void removeMoment(moment)} aria-label="Delete moment"><Trash2 size={11} />Delete</button></div>)}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto">{match.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Completed moments appear here.</p> : match.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border transition ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button><button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border transition ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] font-medium text-cyan-100 hover:bg-cyan-300/20" onClick={() => setEditingMoment(moment)} aria-label="Edit moment"><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] font-medium text-red-100 hover:bg-red-500/25" onClick={() => void removeMoment(moment)} aria-label="Delete moment"><Trash2 size={11} />Delete</button>{moment.notes ? <p className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] leading-4 text-amber-200">{moment.notes}</p> : null}</div>)}</div>
       </Panel>
 
     </div>
@@ -522,4 +544,3 @@ function safeExportName(value: string) {
 function toCsv(rows: string[][]) {
   return `\uFEFF${rows.map((row) => row.map((value) => `"${value.replace(/"/g, '""')}"`).join(",")).join("\r\n")}`;
 }
-

@@ -26,6 +26,10 @@ export type CloudVideoAsset = {
 type UploadStatus = { phase: "preparing" | "uploading" | "finishing"; progress: number; detail: string };
 type UploadedPart = { partNumber: number; etag: string; size?: number };
 
+const UPLOAD_BATCH_SIZE = 12;
+const UPLOAD_CONCURRENCY = 2;
+const UPLOAD_RETRY_DELAYS = [0, 1_000, 2_500, 5_000, 8_000];
+
 export async function getRemoteVideoUrl(matchId: string) {
   return apiFetch<{ url: string; expiresAt: string }>(`/api/matches/${matchId}/video`);
 }
@@ -96,36 +100,35 @@ export async function uploadMatchVideo(matchId: string, file: File, onStatus?: (
 
   try {
     if (missing.length) {
-      const signedParts: Array<{ partNumber: number; url: string }> = [];
-      for (let index = 0; index < missing.length; index += 500) {
+      for (let index = 0; index < missing.length; index += UPLOAD_BATCH_SIZE) {
+        const batch = missing.slice(index, index + UPLOAD_BATCH_SIZE);
         const signed = await apiFetch<{ parts: Array<{ partNumber: number; url: string }> }>(`/api/matches/${matchId}/video/uploads/parts`, {
           method: "POST",
-          body: JSON.stringify({ uploadId: init.uploadId, partNumbers: missing.slice(index, index + 500) }),
+          body: JSON.stringify({ uploadId: init.uploadId, partNumbers: batch }),
         });
-        signedParts.push(...signed.parts);
+        let cursor = 0;
+        const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, signed.parts.length) }, async () => {
+          while (cursor < signed.parts.length) {
+            const current = signed.parts[cursor++];
+            const start = (current.partNumber - 1) * init.partSize;
+            const blob = file.slice(start, Math.min(file.size, start + init.partSize));
+            const etag = await uploadPartWithRetry(current.url, blob, (loaded) => {
+              partProgress.set(current.partNumber, loaded);
+              emitProgress(`Uploading part ${current.partNumber} of ${totalParts}…`);
+            }, signal);
+            const part = { partNumber: current.partNumber, etag, size: blob.size };
+            completed.set(current.partNumber, part);
+            partProgress.set(current.partNumber, blob.size);
+            emitProgress(`Uploaded ${completed.size} of ${totalParts} parts.`);
+          }
+        });
+        await Promise.all(workers);
       }
-      let cursor = 0;
-      const workers = Array.from({ length: Math.min(3, signedParts.length) }, async () => {
-        while (cursor < signedParts.length) {
-          const current = signedParts[cursor++];
-          const start = (current.partNumber - 1) * init.partSize;
-          const blob = file.slice(start, Math.min(file.size, start + init.partSize));
-          const etag = await uploadPartWithRetry(current.url, blob, (loaded) => {
-            partProgress.set(current.partNumber, loaded);
-            emitProgress(`Uploading part ${current.partNumber} of ${totalParts}…`);
-          }, signal);
-          const part = { partNumber: current.partNumber, etag, size: blob.size };
-          completed.set(current.partNumber, part);
-          partProgress.set(current.partNumber, blob.size);
-          emitProgress(`Uploaded ${completed.size} of ${totalParts} parts.`);
-        }
-      });
-      await Promise.all(workers);
     }
     onStatus?.({ phase: "finishing", progress: 1, detail: "Finalizing the video in Cloudflare R2…" });
     const result = await apiFetch<{ video: StoredVideo }>(`/api/matches/${matchId}/video/uploads/complete`, {
       method: "POST",
-      body: JSON.stringify({ uploadId: init.uploadId, parts: [...completed.values()].map(({ partNumber, etag }) => ({ partNumber, etag })) }),
+      body: JSON.stringify({ uploadId: init.uploadId, partSize: init.partSize, parts: [...completed.values()].map(({ partNumber, etag }) => ({ partNumber, etag })) }),
     });
     return { video: result.video, durationSeconds, resumed: init.completedParts.length > 0 };
   } catch (error) {
@@ -133,7 +136,11 @@ export async function uploadMatchVideo(matchId: string, file: File, onStatus?: (
       await apiFetch(`/api/matches/${matchId}/video/uploads`, { method: "DELETE", body: JSON.stringify({ uploadId: init.uploadId }) }).catch(() => undefined);
       throw new DOMException("The video upload was cancelled.", "AbortError");
     }
-    throw new Error(`${error instanceof Error ? error.message : "The upload was interrupted."} Select the same file again to resume it.`);
+    const message = error instanceof Error ? error.message : "The upload was interrupted.";
+    const detail = message === "Failed to fetch"
+      ? "The upload service could not be reached. Check the internet connection and the Cloudflare R2 CORS origin."
+      : message;
+    throw new Error(`${detail} Select the same file again to resume it.`);
   }
 }
 
@@ -143,12 +150,12 @@ function partLength(fileSize: number, partSize: number, partNumber: number) {
 
 async function uploadPartWithRetry(url: string, blob: Blob, onProgress: (loaded: number) => void, signal?: AbortSignal) {
   let lastError: unknown;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  for (let attempt = 0; attempt < UPLOAD_RETRY_DELAYS.length; attempt += 1) {
+    if (UPLOAD_RETRY_DELAYS[attempt]) await new Promise((resolve) => window.setTimeout(resolve, UPLOAD_RETRY_DELAYS[attempt]));
     try { return await uploadPart(url, blob, onProgress, signal); }
     catch (error) {
       if (signal?.aborted) throw error;
       lastError = error;
-      if (attempt < 3) await new Promise((resolve) => window.setTimeout(resolve, attempt * 750));
     }
   }
   throw lastError instanceof Error ? lastError : new Error("A video part could not be uploaded.");
@@ -160,19 +167,24 @@ function uploadPart(url: string, blob: Blob, onProgress: (loaded: number) => voi
     const abort = () => request.abort();
     const cleanup = () => signal?.removeEventListener("abort", abort);
     request.open("PUT", url);
+    request.timeout = 10 * 60 * 1_000;
     request.upload.onprogress = (event) => onProgress(event.loaded);
     request.onload = () => {
       cleanup();
-      if (request.status < 200 || request.status >= 300) return reject(new Error(`Cloudflare rejected a video part (${request.status}).`));
+      if (request.status < 200 || request.status >= 300) return reject(new Error(`Cloudflare R2 rejected a video part (HTTP ${request.status}).`));
       const etag = request.getResponseHeader("ETag");
       if (!etag) return reject(new Error("Cloudflare did not return the ETag for an uploaded part. Check the bucket CORS policy."));
       resolve(etag);
     };
-    request.onerror = () => { cleanup(); reject(new Error("A network error interrupted the video upload.")); };
+    request.onerror = () => {
+      cleanup();
+      const origin = typeof window === "undefined" ? "this site" : window.location.origin;
+      reject(new Error(`The browser could not reach Cloudflare R2 from ${origin}. Check the connection and confirm this exact origin in the bucket CORS policy.`));
+    };
+    request.ontimeout = () => { cleanup(); reject(new Error("A video part timed out while uploading to Cloudflare R2.")); };
     request.onabort = () => { cleanup(); reject(new DOMException("The upload was cancelled.", "AbortError")); };
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) return abort();
     request.send(blob);
   });
 }
-

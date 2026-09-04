@@ -6,12 +6,7 @@ import { ensureMediaWorkspace } from "@/lib/media-workspace";
 import { prisma } from "@/lib/prisma";
 import { completeMultipartUpload } from "@/lib/r2";
 import { serializeVideo } from "@/lib/video";
-
-const MEBIBYTE = 1024 * 1024;
-
-function partSizeFor(fileSize: number) {
-  return Math.max(64 * MEBIBYTE, Math.ceil(fileSize / 10_000 / MEBIBYTE) * MEBIBYTE);
-}
+import { legacyVideoUploadPartSize, videoUploadPartSize } from "@/lib/video-upload";
 
 export async function POST(request: Request, context: { params: Promise<{ matchId: string }> }) {
   try {
@@ -30,7 +25,14 @@ export async function POST(request: Request, context: { params: Promise<{ matchI
     if (!video || video.storageStatus !== "UPLOADING") {
       return Response.json({ error: "The multipart upload is no longer active." }, { status: 400 });
     }
-    const expectedParts = Math.ceil(Number(video.fileSize) / partSizeFor(Number(video.fileSize)));
+    const fileSize = Number(video.fileSize);
+    const requestedPartSize = Number(body.partSize);
+    const allowedPartSizes = [...new Set([videoUploadPartSize(fileSize), legacyVideoUploadPartSize(fileSize)])];
+    const partSize = allowedPartSizes.find((candidate) =>
+      (!Number.isFinite(requestedPartSize) || requestedPartSize <= 0 || candidate === requestedPartSize)
+      && Math.ceil(fileSize / candidate) === parts.length
+    );
+    const expectedParts = partSize ? Math.ceil(fileSize / partSize) : 0;
     const unique = new Set(parts.map((part: { partNumber: number }) => part.partNumber));
     if (parts.length !== expectedParts || unique.size !== expectedParts || parts.some((part: { partNumber: number; etag: string }) => !Number.isInteger(part.partNumber) || part.partNumber < 1 || part.partNumber > expectedParts || !part.etag)) {
       return Response.json({ error: "The uploaded video is missing one or more parts." }, { status: 400 });
@@ -55,4 +57,3 @@ export async function POST(request: Request, context: { params: Promise<{ matchI
     return Response.json({ video: serializeVideo(saved) });
   } catch (error) { return handleApiError(error); }
 }
-

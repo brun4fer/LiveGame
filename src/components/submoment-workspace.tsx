@@ -2,13 +2,14 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, ChevronLeft, ChevronRight, Cloud, Crosshair, FileVideo, Goal, Loader2, MapPin, Pause, Pencil, Play, Save, Trash2, Upload, X } from "lucide-react";
+import { ArrowLeft, ChevronLeft, ChevronRight, Cloud, Crosshair, Download, FileVideo, Goal, Loader2, MapPin, Pause, Pencil, Play, Save, Trash2, Upload, X } from "lucide-react";
 
 import { Coordinate, GoalSurface, PitchSurface } from "@/components/analysis-surfaces";
 import { CloudVideoLibrary } from "@/components/cloud-video-library";
 import { Badge, Button, Label, Panel, Select, TextArea } from "@/components/ui";
 import type { LiveSessionRecord, MatchDetail, MomentRecord, SettingsPayload, SubMomentRecord } from "@/lib/domain";
 import { apiFetch } from "@/lib/http";
+import { isFilePickerCancellation, saveFullVideo } from "@/lib/full-video-download";
 import { locateReplayPosition } from "@/lib/live-replay";
 import { getRememberedMatchVideo, rememberMatchVideo } from "@/lib/local-video-store";
 import { getMatchPeriodAtTime, matchPeriodLabel } from "@/lib/match-periods";
@@ -18,6 +19,7 @@ import { formatBytes, formatTime, roundTime } from "@/lib/time";
 export function SubmomentWorkspace({ matchId }: { matchId: string }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const sourceFileRef = useRef<File | null>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
   const playlistActiveRef = useRef(false);
   const advancingRef = useRef(false);
@@ -45,6 +47,7 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
   const [editingSubmomentId, setEditingSubmomentId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [downloadingVideo, setDownloadingVideo] = useState(false);
   const [showCloudLibrary, setShowCloudLibrary] = useState(false);
   const [cloudAssets, setCloudAssets] = useState<CloudVideoAsset[]>([]);
   const [loadingCloudLibrary, setLoadingCloudLibrary] = useState(false);
@@ -75,6 +78,7 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
         }
         const file = await getRememberedMatchVideo(matchId).catch(() => null);
         if (active && file) {
+          sourceFileRef.current = file;
           setSourceUrl(URL.createObjectURL(file));
           setUsingLiveRecording(false);
           return;
@@ -184,6 +188,7 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
   async function loadVideo(file?: File) {
     if (!file) return;
     if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+    sourceFileRef.current = file;
     setSourceUrl(URL.createObjectURL(file));
     setUsingLiveRecording(false);
     setLiveReplayTarget(null);
@@ -214,6 +219,26 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
     }
   }
 
+  async function downloadFullVideo() {
+    if (!match?.video || downloadingVideo) return;
+    setDownloadingVideo(true);
+    try {
+      const localFile = sourceFileRef.current;
+      await saveFullVideo({
+        file: localFile,
+        resolveRemoteUrl: !localFile && match.video.storageStatus === "READY" ? async () => (await getRemoteVideoUrl(matchId)).url : undefined,
+        fileName: localFile?.name || match.video.fileName,
+        mimeType: localFile?.type || match.video.mimeType,
+        onProgress: (progress) => setNotice(progress === null ? "Downloading the complete match video…" : `Downloading the complete match video… ${Math.round(progress * 100)}%`),
+      });
+      setNotice("Complete match video saved successfully.");
+    } catch (error) {
+      if (!isFilePickerCancellation(error)) setNotice(error instanceof Error ? error.message : "The complete match video could not be downloaded.");
+    } finally {
+      setDownloadingVideo(false);
+    }
+  }
+
   async function openCloudLibrary() {
     setShowCloudLibrary(true);
     setLoadingCloudLibrary(true);
@@ -237,6 +262,7 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
         getRemoteVideoUrl(matchId),
         apiFetch<MatchDetail>(`/api/matches/${matchId}`),
       ]);
+      sourceFileRef.current = null;
       setSourceUrl(remote.url);
       setUsingLiveRecording(false);
       setLiveReplayTarget(null);
@@ -425,10 +451,10 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
 
     {notice ? <div role="status" className="fixed bottom-4 right-4 z-50 flex max-w-sm items-center gap-3 rounded-lg border border-leaf-400/25 bg-pitch-950/95 px-3 py-2 text-xs text-emerald-100 shadow-2xl"><span>{notice}</span><button type="button" aria-label="Dismiss message" onClick={() => setNotice(null)}><X size={13} /></button></div> : null}
 
-    <Panel className="flex shrink-0 flex-wrap items-center gap-2 px-2 py-1.5"><Link href={usingLiveRecording ? `/live/${matchId}` : `/analysis/${matchId}`} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-white/10 bg-white/[.04] px-2.5 text-[10px] font-semibold text-slate-300 transition hover:bg-white/[.08] hover:text-white"><ArrowLeft size={12} />{usingLiveRecording ? "Live tagging" : "Moment tagging"}</Link><span className="hidden min-w-0 max-w-48 truncate text-[10px] font-semibold text-white lg:block">{match.title}</span>{usingLiveRecording ? <Badge className="shrink-0 border-cyan-300/25 bg-cyan-300/10 text-cyan-100">Recorded live video</Badge> : null}<label className="flex min-w-0 flex-1 items-center gap-2"><span className="shrink-0 text-[9px] font-semibold uppercase tracking-[.16em] text-slate-500">Moment</span><Select className="h-8 min-w-0 flex-1 py-0 text-xs" value={filterTypeId} onChange={(event) => changeFilter(event.target.value)}><option value="">All moments ({match.moments.length})</option>{settings.momentTypes.map((type) => <option key={type.id} value={type.id}>{type.name} ({match.moments.filter((moment) => moment.momentTypeId === type.id).length})</option>)}</Select></label><Badge className="shrink-0">{selectedIndex >= 0 ? `${selectedIndex + 1} / ${moments.length}` : `0 / ${moments.length}`}</Badge><Button size="sm" variant="primary" className="h-8 shrink-0" disabled={!hasVideoSource || moments.length === 0} onClick={playAllMoments}><Play size={13} />Play all</Button>{uploading ? <Button size="sm" variant="danger" className="h-8 shrink-0" onClick={() => uploadAbortRef.current?.abort()}><X size={13} />Cancel {Math.round(uploadProgress * 100)}%</Button> : <><Button size="sm" className="h-8 shrink-0" onClick={() => fileInputRef.current?.click()}><Upload size={13} />Upload new</Button><Button size="sm" className="h-8 shrink-0" onClick={() => void openCloudLibrary()}><Cloud size={13} />Cloud library</Button></>}</Panel>
+    <Panel className="flex shrink-0 flex-wrap items-center gap-2 px-2 py-1.5"><Link href={usingLiveRecording ? `/live/${matchId}` : `/analysis/${matchId}`} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-white/10 bg-white/[.04] px-2.5 text-[10px] font-semibold text-slate-300 transition hover:bg-white/[.08] hover:text-white"><ArrowLeft size={12} />{usingLiveRecording ? "Live tagging" : "Moment tagging"}</Link><span className="hidden min-w-0 max-w-48 truncate text-[10px] font-semibold text-white lg:block">{match.title}</span>{usingLiveRecording ? <Badge className="shrink-0 border-cyan-300/25 bg-cyan-300/10 text-cyan-100">Recorded live video</Badge> : null}<label className="flex min-w-0 flex-1 items-center gap-2"><span className="shrink-0 text-[9px] font-semibold uppercase tracking-[.16em] text-slate-500">Moment</span><Select className="h-8 min-w-0 flex-1 py-0 text-xs" value={filterTypeId} onChange={(event) => changeFilter(event.target.value)}><option value="">All moments ({match.moments.length})</option>{settings.momentTypes.map((type) => <option key={type.id} value={type.id}>{type.name} ({match.moments.filter((moment) => moment.momentTypeId === type.id).length})</option>)}</Select></label><Badge className="shrink-0">{selectedIndex >= 0 ? `${selectedIndex + 1} / ${moments.length}` : `0 / ${moments.length}`}</Badge><Button size="sm" variant="primary" className="h-8 shrink-0" disabled={!hasVideoSource || moments.length === 0} onClick={playAllMoments}><Play size={13} />Play all</Button>{uploading ? <Button size="sm" variant="danger" className="h-8 shrink-0" onClick={() => uploadAbortRef.current?.abort()}><X size={13} />Cancel {Math.round(uploadProgress * 100)}%</Button> : <><Button size="sm" className="h-8 shrink-0" onClick={() => fileInputRef.current?.click()}><Upload size={13} />Upload new</Button><Button size="sm" className="h-8 shrink-0" onClick={() => void downloadFullVideo()} disabled={!match.video || downloadingVideo}>{downloadingVideo ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}Download full</Button><Button size="sm" className="h-8 shrink-0" onClick={() => void openCloudLibrary()}><Cloud size={13} />Cloud library</Button></>}</Panel>
 
     <div className="submoment-layout grid min-h-0 flex-1 items-stretch gap-2 min-[900px]:grid-cols-[12rem_minmax(0,1fr)_20rem] min-[1400px]:grid-cols-[15rem_minmax(0,1fr)_22rem]">
-      <Panel className="flex min-h-0 w-full flex-col overflow-hidden"><div className="shrink-0 border-b border-white/10 px-2.5 py-2"><Label>Tagged moments</Label><span className="ml-2 text-[9px] text-slate-600">{moments.length}</span></div><div className="min-h-0 flex-1 overflow-y-auto">{moments.length === 0 ? <p className="p-4 text-xs text-slate-500">There are no moments in this filter.</p> : moments.map((moment, index) => <button key={moment.id} onClick={() => selectMoment(moment)} className={`flex w-full items-center gap-1.5 border-b border-white/[.06] px-2 py-1.5 text-left transition hover:bg-white/[.06] ${selectedMoment?.id === moment.id ? "bg-leaf-400/10" : ""}`}><span className="w-4 shrink-0 text-right font-mono text-[8px] text-slate-600">{index + 1}</span><span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1"><span className="block truncate text-[10px] font-semibold text-white">{moment.momentType.name}</span><span className="block font-mono text-[8px] text-slate-500">{formatTime(moment.startTimeSeconds)}–{formatTime(moment.endTimeSeconds)}</span></span><Badge className="px-1 py-0 text-[8px]">{moment.subMoments.length}</Badge></button>)}</div></Panel>
+      <Panel className="flex min-h-0 w-full flex-col overflow-hidden"><div className="shrink-0 border-b border-white/10 px-2.5 py-2"><Label>Tagged moments</Label><span className="ml-2 text-[9px] text-slate-600">{moments.length}</span></div><div className="min-h-0 flex-1 overflow-y-auto">{moments.length === 0 ? <p className="p-4 text-xs text-slate-500">There are no moments in this filter.</p> : moments.map((moment, index) => <button key={moment.id} onClick={() => selectMoment(moment)} className={`flex w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2 py-1.5 text-left transition hover:bg-white/[.06] ${selectedMoment?.id === moment.id ? "bg-leaf-400/10" : ""}`}><span className="mt-0.5 w-4 shrink-0 text-right font-mono text-[8px] text-slate-600">{index + 1}</span><span className="mt-0.5 h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1"><span className="block truncate text-[10px] font-semibold text-white">{moment.momentType.name}</span><span className="block font-mono text-[8px] text-slate-500">{formatTime(moment.startTimeSeconds)}–{formatTime(moment.endTimeSeconds)}</span></span><Badge className="px-1 py-0 text-[8px]">{moment.subMoments.length}</Badge>{moment.notes ? <span className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[9px] leading-4 text-amber-200">{moment.notes}</span> : null}</button>)}</div></Panel>
 
       <div className="flex min-h-0 min-w-0 flex-col">
         <Panel className="flex min-h-0 flex-1 flex-col overflow-hidden"><div className="relative aspect-video min-h-72 shrink-0 bg-black xl:aspect-auto xl:min-h-0 xl:flex-1">{videoSourceUrl ? <video key={usingLiveRecording ? selectedLiveSegment?.id : "match-video"} ref={videoRef} src={videoSourceUrl} crossOrigin="anonymous" className="h-full w-full object-contain" playsInline onLoadedMetadata={(event) => { event.currentTarget.playbackRate = playbackRate; }} onTimeUpdate={handleTimeUpdate} onEnded={handleVideoEnded} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} /> : <button type="button" onClick={() => fileInputRef.current?.click()} className="flex h-full min-h-72 w-full flex-col items-center justify-center p-6 text-center"><FileVideo size={38} className="text-leaf-400" /><h2 className="mt-3 text-sm font-bold text-white">{restoringVideo ? "Loading the match video…" : "Upload the match video"}</h2><p className="mt-1 max-w-md text-xs text-slate-500">The video will be stored privately in Cloudflare R2.</p>{match.video ? <p className="mt-3 rounded-md border border-white/10 bg-white/[.04] px-3 py-2 text-[10px] text-slate-400">Expected: {match.video.fileName} · {formatBytes(match.video.fileSize)}</p> : null}</button>}{uploading ? <div className="absolute inset-x-0 bottom-0 h-1 bg-white/10"><div className="h-full bg-cyan-300 transition-[width]" style={{ width: `${Math.round(uploadProgress * 100)}%` }} /></div> : null}</div><div className="flex shrink-0 items-center justify-between gap-2 overflow-x-auto border-t border-white/10 p-2"><div className="flex min-w-max gap-1"><Button size="icon" className="h-8 w-8" disabled={selectedIndex <= 0} onClick={() => selectMoment(moments[selectedIndex - 1])}><ChevronLeft size={15} /></Button><Button size="icon" className="h-8 w-8" variant="primary" disabled={!hasVideoSource || !selectedMoment} onClick={togglePlayback}>{playing ? <Pause size={15} /> : <Play size={15} />}</Button><Button size="icon" className="h-8 w-8" disabled={selectedIndex < 0 || selectedIndex >= moments.length - 1} onClick={() => selectMoment(moments[selectedIndex + 1])}><ChevronRight size={15} /></Button><div className="flex overflow-hidden rounded-md border border-white/10">{[.5, 1, 2, 4].map((rate) => <button key={rate} type="button" onClick={() => setRate(rate)} className={`h-8 px-2 text-[10px] font-semibold transition ${playbackRate === rate ? "bg-leaf-400 text-ink-950" : "bg-white/[.04] text-slate-300 hover:bg-white/[.1]"}`}>{rate}×</button>)}</div></div><span className="shrink-0 font-mono text-xs text-white">{formatTime(currentTime)} {selectedMoment ? <span className="text-slate-600">/ {formatTime(selectedMoment.endTimeSeconds)}</span> : null}</span></div></Panel>

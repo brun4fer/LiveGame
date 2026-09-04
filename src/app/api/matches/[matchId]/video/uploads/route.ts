@@ -8,14 +8,9 @@ import { ensureMediaWorkspace } from "@/lib/media-workspace";
 import { prisma } from "@/lib/prisma";
 import { abortMultipartUpload, listMultipartParts } from "@/lib/r2";
 import { serializeVideo } from "@/lib/video";
+import { inferVideoUploadPartSize, videoUploadPartSize } from "@/lib/video-upload";
 
-const MEBIBYTE = 1024 * 1024;
-const DEFAULT_PART_SIZE = 64 * MEBIBYTE;
 const MAX_FILE_SIZE = 5 * 1024 ** 4 - 5 * 1024 ** 3;
-
-function partSizeFor(fileSize: number) {
-  return Math.max(DEFAULT_PART_SIZE, Math.ceil(fileSize / 10_000 / MEBIBYTE) * MEBIBYTE);
-}
 
 export async function POST(request: Request, context: { params: Promise<{ matchId: string }> }) {
   let created: { id: string; key: string; uploadId: string } | null = null;
@@ -48,7 +43,7 @@ export async function POST(request: Request, context: { params: Promise<{ matchI
       && existing.fileName === fileName
       && Number(existing.fileSize) === fileSize
       && existing.lastModified?.getTime() === lastModified?.getTime();
-    const partSize = partSizeFor(fileSize);
+    const partSize = videoUploadPartSize(fileSize);
     if (sameFile && existing.storageStatus === "READY" && (existing.storageKey || existing.mediaAssetId)) {
       return Response.json({ video: serializeVideo(existing), uploadId: null, partSize, completedParts: [], alreadyReady: true });
     }
@@ -57,7 +52,7 @@ export async function POST(request: Request, context: { params: Promise<{ matchI
       if (asset?.storageStatus === "UPLOADING" && asset.uploadId) {
         try {
           const completedParts = await listMediaMultipartParts(asset.storageKey, asset.uploadId);
-          return Response.json({ video: serializeVideo(existing), uploadId: asset.uploadId, partSize, completedParts, alreadyReady: false });
+          return Response.json({ video: serializeVideo(existing), uploadId: asset.uploadId, partSize: inferVideoUploadPartSize(fileSize, completedParts), completedParts, alreadyReady: false });
         } catch {
           await mediaPrisma.mediaAsset.update({ where: { id: asset.id }, data: { storageStatus: "FAILED", uploadId: null } }).catch(() => undefined);
         }
@@ -66,7 +61,7 @@ export async function POST(request: Request, context: { params: Promise<{ matchI
     if (sameFile && existing.storageStatus === "UPLOADING" && existing.storageKey && existing.uploadId) {
       try {
         const completedParts = await listMultipartParts(existing.storageKey, existing.uploadId);
-        return Response.json({ video: serializeVideo(existing), uploadId: existing.uploadId, partSize, completedParts, alreadyReady: false });
+        return Response.json({ video: serializeVideo(existing), uploadId: existing.uploadId, partSize: inferVideoUploadPartSize(fileSize, completedParts), completedParts, alreadyReady: false });
       } catch {
         // The remote multipart session expired; start a fresh one below.
       }
@@ -149,4 +144,3 @@ export async function DELETE(request: Request, context: { params: Promise<{ matc
     return Response.json({ aborted: true });
   } catch (error) { return handleApiError(error); }
 }
-

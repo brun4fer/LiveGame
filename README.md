@@ -179,11 +179,21 @@ If using a capture card, select it as the camera source. Test audio and video be
 3. Approve write access to that folder.
 4. Wait for confirmation that recording has started.
 
-Live Game creates a `.webm` file named after the match and timestamp. At the same time, it creates short cloud replay segments so staff can rewind during the live event.
+Live Game creates an `.mp4` file named after the match and timestamp. At the same time, it creates short internal cloud replay segments so staff can rewind during the live event.
 
 When Cloudflare Stream is configured, **Start live** also publishes the same camera and audio through WebRTC. Staff accounts that open the same match automatically receive the live image. They do not need a camera connected to their own devices.
 
 The first replay segment normally becomes available after approximately five seconds. Recording continues when a user rewinds, pauses, reviews a clip or returns to live.
+
+### Pause at half-time
+
+1. Mark **1H End** at the correct video time.
+2. Select **Pause**. The camera remains connected, but no interval footage is added to the recording.
+3. Keep the browser tab open and prevent the computer from sleeping during the interval.
+4. At the start of the second half, select **Resume**.
+5. Mark **2H Start** at the resumed video time.
+
+Pause and Resume continue writing to the same MP4 file and the same match timeline. If the complete match should include the interval, do not pause the recording.
 
 ### Resume an existing live session
 
@@ -277,19 +287,19 @@ Occurrences outside a complete marked period appear as awaiting period markers a
 Live Game stores two related forms of video:
 
 - **Live replay segments**: short pieces used for rewind and collaborative viewing during the match.
-- **Complete recording**: the `.webm` file saved to the folder chosen by the camera operator.
+- **Complete recording**: the `.mp4` file saved to the folder chosen by the camera operator.
 
-Ending live does not automatically upload the complete local file. Upload it after the match so Reports, Playlists, Maps and later analysis can use one continuous video on every authorised device.
+Ending live finalises the complete local file and displays **Upload full video** on the live screen. Upload it after the match so Reports, Playlists, Maps and later analysis can use one continuous video on every authorised device.
 
 ### Upload the local recording
 
-1. Open the match.
-2. Select **Identify submoments**.
-3. Select **Upload new**.
-4. Choose the `.webm` file created by Live Game.
-5. Keep the page open until upload and finalisation complete.
+1. Select **End live** and wait for the MP4 to be finalised.
+2. Select **Upload full video** on the live screen.
+3. Keep the page open until upload and finalisation complete.
 
-Large uploads are split into parts and can resume when the same file is selected again after an interruption.
+If the page was closed after recording, open the match, select **Identify submoments**, select **Upload new**, and choose the `.mp4` file created by Live Game.
+
+Large uploads are split into small batches, retried automatically and can resume when the same file is selected again after an interruption. The **Download full video** button in **Identify moments** saves the complete match video to the computer.
 
 ### Use an existing cloud video
 
@@ -421,13 +431,15 @@ Recommended practice:
 - Tag moments with buttons or shortcuts.
 - Rewind freely; recording continues.
 - Use **Go Live** to return to the current action.
-- Mark **1H End**, **2H Start** and **2H End**.
+- At half-time, mark **1H End** and select **Pause** if the interval should be excluded.
+- Select **Resume** and mark **2H Start** when the second half begins.
+- Mark **2H End** when the match finishes.
 
 ### After the match
 
 - Select **End live** and wait for finalisation.
-- Confirm that the `.webm` file exists and plays locally.
-- Upload the complete recording.
+- Confirm that the `.mp4` file exists and plays locally.
+- Select **Upload full video**.
 - Verify a moment in Playlists or Reports.
 - Identify submoments and locations.
 - Download a data backup.
