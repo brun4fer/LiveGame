@@ -1,4 +1,5 @@
 import { apiFetch } from "@/lib/http";
+import { shouldUploadReplayFromOrigin } from "@/lib/replay-upload-origin";
 
 export type VideoStorageStatus = "LOCAL" | "UPLOADING" | "READY" | "FAILED";
 
@@ -66,6 +67,9 @@ export async function readVideoDuration(file: File) {
 }
 
 export async function uploadMatchVideo(matchId: string, file: File, onStatus?: (status: UploadStatus) => void, signal?: AbortSignal) {
+  if (!shouldUploadReplayFromOrigin(window.location)) {
+    throw new Error(`Cloud upload is unavailable from ${window.location.origin}. Use http://localhost:3000 on the camera computer or the HTTPS Vercel site.`);
+  }
   onStatus?.({ phase: "preparing", progress: 0, detail: "Preparing multipart upload…" });
   const durationSeconds = await readVideoDuration(file);
   const init = await apiFetch<{

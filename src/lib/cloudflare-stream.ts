@@ -17,6 +17,7 @@ export type RealtimeLiveInput = {
 };
 
 function streamConfig() {
+  if (process.env.CLOUDFLARE_STREAM_ENABLED !== "true") return null;
   const accountId = process.env.CLOUDFLARE_STREAM_ACCOUNT_ID?.trim();
   const apiToken = process.env.CLOUDFLARE_STREAM_API_TOKEN?.trim();
   if (!accountId && !apiToken) return null;

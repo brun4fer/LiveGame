@@ -5,11 +5,14 @@ import { cloudflareStreamConfigured, createRealtimeLiveInput } from "@/lib/cloud
 
 const originalAccountId = process.env.CLOUDFLARE_STREAM_ACCOUNT_ID;
 const originalApiToken = process.env.CLOUDFLARE_STREAM_API_TOKEN;
+const originalEnabled = process.env.CLOUDFLARE_STREAM_ENABLED;
 const originalRecordingMode = process.env.CLOUDFLARE_STREAM_RECORDING_MODE;
 const originalAllowedOrigins = process.env.CLOUDFLARE_STREAM_ALLOWED_ORIGINS;
 const originalFetch = global.fetch;
 
 function restoreEnvironment() {
+  if (originalEnabled === undefined) delete process.env.CLOUDFLARE_STREAM_ENABLED;
+  else process.env.CLOUDFLARE_STREAM_ENABLED = originalEnabled;
   if (originalAccountId === undefined) delete process.env.CLOUDFLARE_STREAM_ACCOUNT_ID;
   else process.env.CLOUDFLARE_STREAM_ACCOUNT_ID = originalAccountId;
   if (originalApiToken === undefined) delete process.env.CLOUDFLARE_STREAM_API_TOKEN;
@@ -24,13 +27,25 @@ function restoreEnvironment() {
 test.afterEach(restoreEnvironment);
 
 test("keeps realtime streaming optional when Stream credentials are absent", async () => {
+  delete process.env.CLOUDFLARE_STREAM_ENABLED;
   delete process.env.CLOUDFLARE_STREAM_ACCOUNT_ID;
   delete process.env.CLOUDFLARE_STREAM_API_TOKEN;
   assert.equal(cloudflareStreamConfigured(), false);
   assert.equal(await createRealtimeLiveInput({ name: "Test", matchId: "match", workspaceId: "workspace" }), null);
 });
 
+test("does not contact Stream unless realtime sharing is explicitly enabled", async () => {
+  process.env.CLOUDFLARE_STREAM_ENABLED = "false";
+  process.env.CLOUDFLARE_STREAM_ACCOUNT_ID = "account-id";
+  process.env.CLOUDFLARE_STREAM_API_TOKEN = "stream-secret";
+  global.fetch = (async () => { throw new Error("Stream should not be contacted."); }) as typeof fetch;
+
+  assert.equal(cloudflareStreamConfigured(), false);
+  assert.equal(await createRealtimeLiveInput({ name: "Test", matchId: "match", workspaceId: "workspace" }), null);
+});
+
 test("creates a private server-side Cloudflare Stream WebRTC input", async () => {
+  process.env.CLOUDFLARE_STREAM_ENABLED = "true";
   process.env.CLOUDFLARE_STREAM_ACCOUNT_ID = "account-id";
   process.env.CLOUDFLARE_STREAM_API_TOKEN = "stream-secret";
   process.env.CLOUDFLARE_STREAM_RECORDING_MODE = "off";

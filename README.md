@@ -181,7 +181,7 @@ If using a capture card, select it as the camera source. Test audio and video be
 
 Live Game creates an `.mp4` file named after the match and timestamp. At the same time, it creates short internal cloud replay segments so staff can rewind during the live event.
 
-When Cloudflare Stream is configured, **Start live** also publishes the same camera and audio through WebRTC. Staff accounts that open the same match automatically receive the live image. They do not need a camera connected to their own devices.
+When Cloudflare Stream is explicitly enabled and configured, **Start live** also publishes the same camera and audio through WebRTC. Staff accounts that open the same match automatically receive the live image. They do not need a camera connected to their own devices.
 
 The first replay segment normally becomes available after approximately five seconds. Recording continues when a user rewinds, pauses, reviews a clip or returns to live.
 
@@ -522,14 +522,19 @@ This section is for the person deploying Live Game, not normal match-day users.
 
 Realtime camera sharing uses Cloudflare Stream in addition to R2. R2 remains responsible for the rewindable segment archive; Stream distributes the current camera image through WebRTC.
 
+Cloudflare Stream is disabled by default while multi-device transmission is not being used.
+
 1. Enable Cloudflare Stream on the same Cloudflare account.
 2. Create an Account API Token with **Stream Write** permission.
-3. Add `CLOUDFLARE_STREAM_ACCOUNT_ID` to the local environment and Vercel.
-4. Add `CLOUDFLARE_STREAM_API_TOKEN` to the local environment and Vercel. This secret must never use a `NEXT_PUBLIC_` prefix.
-5. Set `CLOUDFLARE_STREAM_RECORDING_MODE` to `off` when R2 and the local file remain the recording sources, or `automatic` when an additional Stream recording is required.
-6. Optionally set `CLOUDFLARE_STREAM_ALLOWED_ORIGINS` to a comma-separated list of authorised hostnames.
-7. Redeploy Live Game after changing the variables.
+3. Set `CLOUDFLARE_STREAM_ENABLED=true` only when realtime sharing is required.
+4. Add `CLOUDFLARE_STREAM_ACCOUNT_ID` to the local environment and Vercel.
+5. Add `CLOUDFLARE_STREAM_API_TOKEN` to the local environment and Vercel. This secret must never use a `NEXT_PUBLIC_` prefix.
+6. Set `CLOUDFLARE_STREAM_RECORDING_MODE` to `off` when R2 and the local file remain the recording sources, or `automatic` when an additional Stream recording is required.
+7. Optionally set `CLOUDFLARE_STREAM_ALLOWED_ORIGINS` to a comma-separated list of authorised hostnames.
+8. Redeploy Live Game after changing the variables.
 
-When Stream is unavailable or not configured, starting the match still preserves local recording and R2 replay. The operator receives a warning and remote staff continue with the delayed segment feed.
+When Stream is disabled, starting the match continues normally without attempting realtime transmission.
+
+When developing through an insecure LAN address such as `http://192.168.x.x:3000`, replay segments stay in that browser instead of being uploaded to R2. Use `http://localhost:3000` on the camera computer, or HTTPS in production, for persistent cloud replay and full-video uploads.
 
 Run `npm run r2:check` to verify R2 credentials without changing existing media. Run `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` before deployment.

@@ -87,7 +87,7 @@ export async function startLiveSession(matchId: string, input: Record<string, un
   const existing = await prisma.liveSession.findFirst({ where: { matchId, status: { in: [LiveSessionStatus.PREPARING, LiveSessionStatus.LIVE] } }, include: liveSessionInclude });
   if (existing) {
     const serialized = serializeLiveSession(existing as never);
-    if (existing.startedByUserId !== user.id || existing.provider !== "cloudflare-stream" || !existing.providerSessionId) return serialized;
+    if (!cloudflareStreamConfigured() || existing.startedByUserId !== user.id || existing.provider !== "cloudflare-stream" || !existing.providerSessionId) return serialized;
     try {
       const realtime = await getRealtimeLiveInput(existing.providerSessionId);
       return { ...serialized, publishUrl: realtime?.publishUrl ?? null, realtimeAvailable: Boolean(realtime) };

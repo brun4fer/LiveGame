@@ -14,6 +14,7 @@ import { closeWebRtcSession, publishCameraStream, receiveCameraStream, type Brow
 import { getReplayEdge, locateReplayPosition } from "@/lib/live-replay";
 import { getMatchPeriodAtTime } from "@/lib/match-periods";
 import { uploadMatchVideo } from "@/lib/remote-video-store";
+import { shouldUploadReplayFromOrigin } from "@/lib/replay-upload-origin";
 import { formatTime, roundTime } from "@/lib/time";
 
 const SEGMENT_MILLISECONDS = 5_000;
@@ -554,7 +555,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   async function startRealtimePublisher(activeSession: LiveSessionRecord) {
     closeWebRtcSession(publisherSessionRef.current);
     publisherSessionRef.current = null;
-    if (!activeSession.publishUrl) return activeSession.realtimeError || "Realtime camera sharing is not configured. Staff will use the delayed cloud replay.";
+    if (!activeSession.publishUrl) return activeSession.realtimeError || null;
     if (!streamRef.current) return "The camera stream is not available for realtime sharing.";
     try {
       const published = await publishCameraStream(streamRef.current, activeSession.publishUrl);
@@ -617,10 +618,13 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     const startedAtSeconds = segmentTimelineCursorRef.current;
     segmentStartedAtClockRef.current = Date.now();
     const mimeType = supportedSegmentMimeType();
-    const preparation = apiFetch<PreparedSegment>(`/api/live-sessions/${activeSession.id}/segments`, {
-      method: "POST",
-      body: JSON.stringify({ sequence, startedAtSeconds, mimeType }),
-    }).then((prepared) => ({ prepared, error: null })).catch((error: unknown) => ({ prepared: null, error }));
+    const cloudReplayEnabled = shouldUploadReplayFromOrigin(window.location);
+    const preparation = cloudReplayEnabled
+      ? apiFetch<PreparedSegment>(`/api/live-sessions/${activeSession.id}/segments`, {
+          method: "POST",
+          body: JSON.stringify({ sequence, startedAtSeconds, mimeType }),
+        }).then((prepared) => ({ prepared, error: null })).catch((error: unknown) => ({ prepared: null, error }))
+      : Promise.resolve({ prepared: null, error: null });
     const chunks: BlobPart[] = [];
     const recorder = new MediaRecorder(streamRef.current, { mimeType, videoBitsPerSecond: 8_000_000, audioBitsPerSecond: 128_000 });
     recorderRef.current = recorder;
@@ -656,7 +660,10 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         setSession((current) => current && current.id === activeSession.id
           ? { ...current, segments: [...current.segments.filter((segment) => segment.sequence !== sequence), localSegment].sort((a, b) => a.sequence - b.sequence) }
           : current);
-        if (!prepared) throw error instanceof Error ? error : new Error(`Cloud replay segment ${sequence + 1} could not be prepared.`);
+        if (!prepared) {
+          if (error) throw error instanceof Error ? error : new Error(`Cloud replay segment ${sequence + 1} could not be prepared.`);
+          return;
+        }
         try {
           const saved = await uploadSegment(activeSession.id, prepared, blob, durationSeconds);
           setSession((current) => current && current.id === activeSession.id
