@@ -213,7 +213,7 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
     if (video.readyState >= 1) applyTarget();
     else video.addEventListener("loadedmetadata", applyTarget, { once: true });
     return () => video.removeEventListener("loadedmetadata", applyTarget);
-  }, [liveReplayTarget, playbackRate, selectedLiveSegment, usingLiveRecording]);
+  }, [liveReplayTarget?.command, selectedLiveSegment?.id, selectedLiveSegment?.playbackUrl, usingLiveRecording]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (availableSubmomentTypes.some((type) => type.id === selectedSubMomentTypeId)) return;

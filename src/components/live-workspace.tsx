@@ -350,7 +350,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     if (video.readyState >= 1) applyTarget();
     else video.addEventListener("loadedmetadata", applyTarget, { once: true });
     return () => video.removeEventListener("loadedmetadata", applyTarget);
-  }, [playbackRate, replayTarget, selectedSegment]);
+  }, [replayTarget?.command, selectedSegment?.id, selectedSegment?.playbackUrl]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!atLiveEdge || cameraConnected || !activeLive || readySegments.length === 0) return;
