@@ -14,3 +14,7 @@ test("clamps a live moment to the beginning of the recording", () => {
 test("supports an adjusted lead time", () => {
   assert.deepEqual(liveMomentWindow(90, 35), { startTimeSeconds: 55, endTimeSeconds: 90, durationSeconds: 35 });
 });
+
+test("does not let a moment cross into the previous recording part", () => {
+  assert.deepEqual(liveMomentWindow(2_710, 20, 2_700), { startTimeSeconds: 2_700, endTimeSeconds: 2_710, durationSeconds: 10 });
+});

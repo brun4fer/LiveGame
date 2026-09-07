@@ -7,11 +7,11 @@ import { ArrowLeft, ChevronLeft, ChevronRight, Cloud, Crosshair, Download, FileV
 import { Coordinate, GoalSurface, PitchSurface } from "@/components/analysis-surfaces";
 import { CloudVideoLibrary } from "@/components/cloud-video-library";
 import { Badge, Button, Label, Panel, Select, TextArea } from "@/components/ui";
-import type { LiveSessionRecord, MatchDetail, MomentRecord, SettingsPayload, SubMomentRecord } from "@/lib/domain";
+import type { LiveSegmentRecord, LiveSessionRecord, MatchDetail, MomentRecord, SettingsPayload, SubMomentRecord } from "@/lib/domain";
 import { apiFetch } from "@/lib/http";
 import { isFilePickerCancellation, saveFullVideo } from "@/lib/full-video-download";
 import { locateReplayPosition } from "@/lib/live-replay";
-import { getRememberedMatchVideo, rememberMatchVideo } from "@/lib/local-video-store";
+import { getRememberedMatchVideo, getRememberedMatchVideoParts, rememberMatchVideo } from "@/lib/local-video-store";
 import { getMatchPeriodAtTime, matchPeriodLabel } from "@/lib/match-periods";
 import { attachCloudVideo, getCloudVideoLibrary, getRemoteVideoUrl, uploadMatchVideo, type CloudVideoAsset } from "@/lib/remote-video-store";
 import { formatBytes, formatTime, roundTime } from "@/lib/time";
@@ -24,11 +24,13 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
   const playlistActiveRef = useRef(false);
   const advancingRef = useRef(false);
   const replayCommandRef = useRef(0);
+  const localPartUrlsRef = useRef<string[]>([]);
   const [match, setMatch] = useState<MatchDetail | null>(null);
   const [settings, setSettings] = useState<SettingsPayload | null>(null);
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
   const [usingLiveRecording, setUsingLiveRecording] = useState(false);
   const [liveSession, setLiveSession] = useState<LiveSessionRecord | null>(null);
+  const [localPartSegments, setLocalPartSegments] = useState<LiveSegmentRecord[]>([]);
   const [liveReplayTarget, setLiveReplayTarget] = useState<{ segmentId: string; offsetSeconds: number; autoplay: boolean; command: number } | null>(null);
   const [restoringVideo, setRestoringVideo] = useState(true);
   const [loading, setLoading] = useState(true);
@@ -60,21 +62,37 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
       apiFetch<MatchDetail>(`/api/matches/${matchId}`),
       apiFetch<SettingsPayload>("/api/settings"),
       apiFetch<LiveSessionRecord | null>(`/api/matches/${matchId}/live`),
+      getRememberedMatchVideoParts(matchId).catch(() => []),
     ])
-      .then(async ([matchData, settingsData, sessionData]) => {
+      .then(async ([matchData, settingsData, sessionData, localParts]) => {
         if (!active) return;
         playlistActiveRef.current = true;
         setMatch(matchData);
         setSettings(settingsData);
         setLiveSession(sessionData);
         setSelectedMomentId(matchData.moments[0]?.id || null);
-        if (matchData.video?.storageStatus === "READY") {
-          const remote = await getRemoteVideoUrl(matchId).catch(() => null);
-          if (active && remote) {
-            setSourceUrl(remote.url);
-            setUsingLiveRecording(false);
-            return;
-          }
+        if (localParts.length > 0) {
+          const partSegments = localParts.map<LiveSegmentRecord>((part) => {
+            const playbackUrl = URL.createObjectURL(part.file);
+            localPartUrlsRef.current.push(playbackUrl);
+            return {
+              id: `local-part-${part.id}`,
+              sequence: part.partNumber,
+              startedAtSeconds: part.startTimeSeconds,
+              durationSeconds: part.durationSeconds,
+              mimeType: part.file.type || "video/mp4",
+              fileSize: String(part.file.size),
+              status: "READY",
+              readyAt: new Date(part.savedAt).toISOString(),
+              playbackUrl,
+              playbackUrlExpiresAt: null,
+            };
+          });
+          setLocalPartSegments(partSegments);
+          const position = locateReplayPosition(partSegments, matchData.moments[0]?.startTimeSeconds || 0);
+          setUsingLiveRecording(true);
+          if (position) setLiveReplayTarget({ segmentId: position.segment.id, offsetSeconds: position.offsetSeconds, autoplay: false, command: ++replayCommandRef.current });
+          return;
         }
         const file = await getRememberedMatchVideo(matchId).catch(() => null);
         if (active && file) {
@@ -82,6 +100,14 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
           setSourceUrl(URL.createObjectURL(file));
           setUsingLiveRecording(false);
           return;
+        }
+        if (matchData.video?.storageStatus === "READY") {
+          const remote = await getRemoteVideoUrl(matchId).catch(() => null);
+          if (active && remote) {
+            setSourceUrl(remote.url);
+            setUsingLiveRecording(false);
+            return;
+          }
         }
         const readySegments = sessionData?.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl) || [];
         if (active && readySegments.length > 0) {
@@ -104,8 +130,20 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
     if (sourceUrl) URL.revokeObjectURL(sourceUrl);
   }, [sourceUrl]);
 
+  useEffect(() => () => {
+    for (const url of localPartUrlsRef.current) URL.revokeObjectURL(url);
+    localPartUrlsRef.current = [];
+  }, []);
+
   const moments = useMemo(() => (match?.moments || []).filter((moment) => !filterTypeId || moment.momentTypeId === filterTypeId), [filterTypeId, match?.moments]);
-  const liveSegments = useMemo(() => liveSession?.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl).sort((a, b) => a.sequence - b.sequence) || [], [liveSession?.segments]);
+  const liveSegments = useMemo(() => {
+    const remoteSegments = liveSession?.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl) || [];
+    const uncovered = remoteSegments.filter((segment) => !localPartSegments.some((part) => {
+      const end = part.startedAtSeconds + (part.durationSeconds || 0);
+      return segment.startedAtSeconds >= part.startedAtSeconds - 0.05 && segment.startedAtSeconds < end - 0.05;
+    }));
+    return [...localPartSegments, ...uncovered].sort((a, b) => a.startedAtSeconds - b.startedAtSeconds || a.sequence - b.sequence);
+  }, [liveSession?.segments, localPartSegments]);
   const selectedLiveSegment = liveSegments.find((segment) => segment.id === liveReplayTarget?.segmentId) || null;
   const videoSourceUrl = usingLiveRecording ? selectedLiveSegment?.playbackUrl || null : sourceUrl;
   const hasVideoSource = Boolean(videoSourceUrl);
@@ -202,15 +240,11 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
         setUploadProgress(progress);
         setNotice(`${detail} ${Math.round(progress * 100)}%`);
       }, controller.signal);
-      const [remote, savedMatch] = await Promise.all([
-        getRemoteVideoUrl(matchId),
-        apiFetch<MatchDetail>(`/api/matches/${matchId}`),
-      ]);
-      setSourceUrl(remote.url);
+      const savedMatch = await apiFetch<MatchDetail>(`/api/matches/${matchId}`);
       setUsingLiveRecording(false);
       setLiveReplayTarget(null);
       setMatch(savedMatch);
-      setNotice(result.resumed ? "Video upload resumed and completed successfully." : "Video stored securely in Cloudflare R2.");
+      setNotice(result.resumed ? "Video upload resumed and completed successfully. The local copy remains active." : "Video stored securely in Cloudflare R2. The local copy remains active.");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The video could not be uploaded.");
     } finally {

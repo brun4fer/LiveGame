@@ -9,10 +9,11 @@ import { createObjectUploadUrl, createPlaybackUrl } from "@/lib/r2";
 export const DEFAULT_LIVE_LEAD_SECONDS = 20;
 const MAX_SEGMENT_SECONDS = 15;
 
-export function liveMomentWindow(markedAtSeconds: number, leadSeconds = DEFAULT_LIVE_LEAD_SECONDS) {
+export function liveMomentWindow(markedAtSeconds: number, leadSeconds = DEFAULT_LIVE_LEAD_SECONDS, minimumStartSeconds = 0) {
   if (!Number.isFinite(markedAtSeconds) || markedAtSeconds <= 0) throw new Error("The live playhead is not ready yet.");
   if (!Number.isFinite(leadSeconds) || leadSeconds < 1 || leadSeconds > 120) throw new Error("The lead time must be between 1 and 120 seconds.");
-  const startTimeSeconds = Math.max(0, markedAtSeconds - leadSeconds);
+  if (!Number.isFinite(minimumStartSeconds) || minimumStartSeconds < 0 || minimumStartSeconds > markedAtSeconds) throw new Error("The recording part start time is invalid.");
+  const startTimeSeconds = Math.max(minimumStartSeconds, markedAtSeconds - leadSeconds);
   return { startTimeSeconds, endTimeSeconds: markedAtSeconds, durationSeconds: markedAtSeconds - startTimeSeconds };
 }
 
@@ -101,7 +102,7 @@ export async function startLiveSession(matchId: string, input: Record<string, un
   let realtime: Awaited<ReturnType<typeof createRealtimeLiveInput>> = null;
   let realtimeError: string | null = null;
   try {
-    if (cloudflareStreamConfigured()) realtime = await createRealtimeLiveInput({ name: match.title, matchId: match.id, workspaceId: workspace.id });
+    if (input.enableRealtime === true && cloudflareStreamConfigured()) realtime = await createRealtimeLiveInput({ name: match.title, matchId: match.id, workspaceId: workspace.id });
   } catch (error) {
     realtimeError = error instanceof Error ? error.message : "Cloudflare Stream could not be started.";
   }
@@ -179,7 +180,8 @@ export async function markLiveMoment(matchId: string, input: Record<string, unkn
   const { user, workspace } = await requireWorkspace();
   const markedAtSeconds = Number(input.markedAtSeconds);
   const leadSeconds = input.leadSeconds === undefined ? DEFAULT_LIVE_LEAD_SECONDS : Number(input.leadSeconds);
-  const window = liveMomentWindow(markedAtSeconds, leadSeconds);
+  const partStartedAtSeconds = input.partStartedAtSeconds === undefined ? 0 : Number(input.partStartedAtSeconds);
+  const window = liveMomentWindow(markedAtSeconds, leadSeconds, partStartedAtSeconds);
   const momentTypeId = String(input.momentTypeId || "");
   const [match, type, session] = await Promise.all([
     prisma.match.findFirstOrThrow({ where: { id: matchId, workspaceId: workspace.id } }),

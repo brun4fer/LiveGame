@@ -41,7 +41,7 @@ For staff devices:
 - A stable Wi-Fi or wired connection.
 - A separate Live Game account for each staff member.
 
-Keep the camera computer connected to power. Its Live Game tab must remain open until **End live** has finished finalising the recording.
+Keep the camera computer connected to power. Its Live Game tab must remain open while a part is recording and until **End part** or **End match** has finished finalising the current MP4.
 
 ## Accounts and team access
 
@@ -187,24 +187,26 @@ The first replay segment normally becomes available after approximately five sec
 
 ### Pause at half-time
 
-1. Mark **1H End** at the correct video time.
-2. Select **Pause**. The camera remains connected, but no interval footage is added to the recording.
-3. Keep the browser tab open and prevent the computer from sleeping during the interval.
-4. At the start of the second half, select **Resume**.
-5. Mark **2H Start** at the resumed video time.
+1. Select **End part** when the referee ends the first half.
+2. Wait until Live Game confirms that the first-half MP4 was saved.
+3. Take the same computer to the dressing room. The tagged moments, notes, timeline and individual MP4 export buttons remain available.
+4. Review any tagged moment by selecting it. The original recording file is already closed, so it is safe to replay repeatedly during the interval.
+5. Return to the camera position and select **Start next part**.
+6. Live Game reconnects the camera and creates a separate second-half MP4 in the same folder.
+7. Continue tagging normally. The match timeline resumes where the first half ended; time spent in the dressing room is not included.
 
-Pause and Resume continue writing to the same MP4 file and the same match timeline. If the complete match should include the interval, do not pause the recording.
+Live Game automatically fills the 1H and 2H start/end markers when they are empty. They can still be adjusted manually. Do not rename, move or delete the recording files until the match work is complete.
 
 ### Resume an existing live session
 
-If the camera page is interrupted but the session remains active, the operator who started it can reconnect the camera and select **Resume recording**. Other users see **Live running** and cannot take control of that camera recording.
+If the page is interrupted, reopen the same match on the same computer. Live Game attempts to restore the local recording parts. The browser may ask for access to the recording folder again. Select **Start next part** to continue in a new MP4.
 
 ### End recording
 
 1. Return to the camera computer.
-2. Select **End live**.
+2. Select **End match**.
 3. Wait while **Finalizing…** is displayed.
-4. Confirm that Live Game reports the local file as saved.
+4. Confirm that Live Game reports all local recording parts as saved.
 
 Do not close the browser, disconnect the camera or remove the storage drive during finalisation.
 
@@ -246,6 +248,7 @@ Live Game stores the previous 20 seconds ending at the current playhead:
 - At the live edge, it ends at the current live time.
 - During replay, it ends at the selected replay position.
 - Near the beginning, its start is automatically limited to `00:00`.
+- Near the start of the second half, its start is limited to the beginning of the second-half file and never crosses into the first-half recording.
 
 The recording is never cut or interrupted. A moment is a saved time range pointing to the original video.
 
@@ -254,6 +257,8 @@ The recording is never cut or interrupted. A moment is a saved time range pointi
 Select a row under **Tagged moments** or select its bar in the bottom timeline. Playback jumps to its start and stops at its end.
 
 Use the green check for a positive outcome or the red cross for a negative outcome. Select the active result again to clear it.
+
+Use the download icon beside a completed moment to export only that moment as an MP4. A moment from the current part becomes exportable after **End part** finalises that part.
 
 ### Adjust a moment
 
@@ -282,24 +287,22 @@ After a marker is saved, selecting its main area jumps to that time. Use the sma
 
 Occurrences outside a complete marked period appear as awaiting period markers and are excluded from normal half-based map results.
 
-## Save and upload the complete recording
+## Save the match recording locally
 
-Live Game stores two related forms of video:
+Live Game stores two related local forms of video:
 
-- **Live replay segments**: short pieces used for rewind and collaborative viewing during the match.
-- **Complete recording**: the `.mp4` file saved to the folder chosen by the camera operator.
+- **Live replay segments**: short temporary pieces used for rewind while the page is open.
+- **Recording parts**: final `.mp4` files saved to the folder chosen by the camera operator, normally one for each half.
 
-Ending live finalises the complete local file and displays **Upload full video** on the live screen. Upload it after the match so Reports, Playlists, Maps and later analysis can use one continuous video on every authorised device.
+Selecting **End part** finalises the current MP4 without ending the match. Selecting **Start next part** creates another MP4 and continues the same annotation timeline. The interval is not recorded and all moments remain attached to the same match.
 
-### Upload the local recording
+The local files are the primary recording and no cloud upload is required for the same-computer workflow. Keep every part in the selected folder. Live Game remembers which global match-time range belongs to each file.
 
-1. Select **End live** and wait for the MP4 to be finalised.
-2. Select **Upload full video** on the live screen.
-3. Keep the page open until upload and finalisation complete.
+### Optional manual cloud upload
 
-If the page was closed after recording, open the match, select **Identify submoments**, select **Upload new**, and choose the `.mp4` file created by Live Game.
+Cloud upload is not part of the normal two-part live workflow. Use **Upload new** in the analysis screens only for a separate, already combined match video that should be available on other devices. Do not upload only the second-half file as if it were the complete match.
 
-Large uploads are split into small batches, retried automatically and can resume when the same file is selected again after an interruption. The **Download full video** button in **Identify moments** saves the complete match video to the computer.
+Large optional uploads are split into small batches, retried automatically and can resume when the same file is selected again after an interruption.
 
 ### Use an existing cloud video
 
@@ -431,16 +434,16 @@ Recommended practice:
 - Tag moments with buttons or shortcuts.
 - Rewind freely; recording continues.
 - Use **Go Live** to return to the current action.
-- At half-time, mark **1H End** and select **Pause** if the interval should be excluded.
-- Select **Resume** and mark **2H Start** when the second half begins.
-- Mark **2H End** when the match finishes.
+- At half-time, select **End part** and wait for the first-half MP4 to be saved.
+- Review or export the tagged moments on the same computer.
+- Select **Start next part** when the second half begins.
+- The period markers are filled automatically when empty and can be corrected manually.
 
 ### After the match
 
-- Select **End live** and wait for finalisation.
-- Confirm that the `.mp4` file exists and plays locally.
-- Select **Upload full video**.
-- Verify a moment in Playlists or Reports.
+- Select **End match** and wait for finalisation.
+- Confirm that the `1H` and `2H` `.mp4` files exist and play locally.
+- Verify several tagged moments and export one with its download button.
 - Identify submoments and locations.
 - Download a data backup.
 
@@ -520,20 +523,21 @@ This section is for the person deploying Live Game, not normal match-day users.
 
 ### Realtime camera sharing
 
-Realtime camera sharing uses Cloudflare Stream in addition to R2. R2 remains responsible for the rewindable segment archive; Stream distributes the current camera image through WebRTC.
+Live Game is local-first by default. The complete first- and second-half MP4 files and the rewindable replay stay on the camera computer, while annotations remain in the application database. R2 replay upload and Cloudflare Stream are optional features for multi-device use.
 
 Cloudflare Stream is disabled by default while multi-device transmission is not being used.
 
 1. Enable Cloudflare Stream on the same Cloudflare account.
 2. Create an Account API Token with **Stream Write** permission.
 3. Set `CLOUDFLARE_STREAM_ENABLED=true` only when realtime sharing is required.
-4. Add `CLOUDFLARE_STREAM_ACCOUNT_ID` to the local environment and Vercel.
-5. Add `CLOUDFLARE_STREAM_API_TOKEN` to the local environment and Vercel. This secret must never use a `NEXT_PUBLIC_` prefix.
-6. Set `CLOUDFLARE_STREAM_RECORDING_MODE` to `off` when R2 and the local file remain the recording sources, or `automatic` when an additional Stream recording is required.
-7. Optionally set `CLOUDFLARE_STREAM_ALLOWED_ORIGINS` to a comma-separated list of authorised hostnames.
-8. Redeploy Live Game after changing the variables.
+4. Set `NEXT_PUBLIC_LIVE_CLOUD_REPLAY_ENABLED=true` only when rewindable replay must also be uploaded to R2. Leave it `false` for the same-computer workflow.
+5. Add `CLOUDFLARE_STREAM_ACCOUNT_ID` to the local environment and Vercel.
+6. Add `CLOUDFLARE_STREAM_API_TOKEN` to the local environment and Vercel. This secret must never use a `NEXT_PUBLIC_` prefix.
+7. Set `CLOUDFLARE_STREAM_RECORDING_MODE` to `off` when the local files remain the recording source, or `automatic` when an additional Stream recording is required.
+8. Optionally set `CLOUDFLARE_STREAM_ALLOWED_ORIGINS` to a comma-separated list of authorised hostnames.
+9. Redeploy Live Game after changing the variables.
 
-When Stream is disabled, starting the match continues normally without attempting realtime transmission.
+When both optional flags are disabled, starting and reviewing the match does not require Cloudflare media services and no automatic replay upload is attempted.
 
 When developing through an insecure LAN address such as `http://192.168.x.x:3000`, replay segments stay in that browser instead of being uploaded to R2. Use `http://localhost:3000` on the camera computer, or HTTPS in production, for persistent cloud replay and full-video uploads.
 

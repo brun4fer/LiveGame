@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Loader2, Pause, Pencil, Play, Radio, RotateCcw, Settings2, Trash2, Upload, Users, Video, X } from "lucide-react";
+import { ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Loader2, Pause, Pencil, Play, Radio, RotateCcw, Settings2, Trash2, Users, Video, X } from "lucide-react";
 
 import { MatchEditDialog } from "@/components/match-edit-dialog";
 import { MomentEditDialog } from "@/components/moment-edit-dialog";
@@ -11,11 +11,13 @@ import { Badge, Button, Panel, Select } from "@/components/ui";
 import type { AccountPayload, LiveSegmentRecord, LiveSessionRecord, MatchDetail, MomentRecord, SettingsPayload } from "@/lib/domain";
 import { apiFetch } from "@/lib/http";
 import { closeWebRtcSession, publishCameraStream, receiveCameraStream, type BrowserWebRtcSession } from "@/lib/cloudflare-webrtc";
+import { getRememberedMatchVideoParts, rememberMatchVideoPart, type LocalMatchVideoPart, type LocalVideoFileHandle } from "@/lib/local-video-store";
 import { getReplayEdge, locateReplayPosition } from "@/lib/live-replay";
 import { getMatchPeriodAtTime } from "@/lib/match-periods";
-import { uploadMatchVideo } from "@/lib/remote-video-store";
 import { shouldUploadReplayFromOrigin } from "@/lib/replay-upload-origin";
+import { SmartVideoExportSession } from "@/lib/smart-video-export";
 import { formatTime, roundTime } from "@/lib/time";
+import { downloadBlob } from "@/lib/video-export";
 
 const SEGMENT_MILLISECONDS = 5_000;
 
@@ -24,7 +26,7 @@ type LiveViewer = { user: { id: string; name: string; username: string }; atLive
 type ReplayTarget = { segmentId: string; offsetSeconds: number; autoplay: boolean; command: number };
 type PeriodMarkerKey = "firstHalfStartSeconds" | "firstHalfEndSeconds" | "secondHalfStartSeconds" | "secondHalfEndSeconds";
 type LocalWritableFile = { write(data: Blob): Promise<void>; close(): Promise<void>; abort?(): Promise<void> };
-type LocalFileHandle = { name: string; createWritable(): Promise<LocalWritableFile>; getFile(): Promise<File> };
+type LocalFileHandle = LocalVideoFileHandle & { createWritable(): Promise<LocalWritableFile> };
 type LocalDirectoryHandle = { getFileHandle(name: string, options: { create: true }): Promise<LocalFileHandle> };
 
 const periodMarkers: Array<[PeriodMarkerKey, string]> = [
@@ -65,10 +67,11 @@ function supportedArchiveMimeType() {
   return options.find((type) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(type)) || null;
 }
 
-function localRecordingFileName(title: string) {
+function localRecordingFileName(title: string, partNumber: number) {
   const safeTitle = title.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "live-game";
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return `${safeTitle}-${timestamp}.mp4`;
+  const partLabel = partNumber === 1 ? "1H" : partNumber === 2 ? "2H" : `Part-${partNumber}`;
+  return `${safeTitle}-${partLabel}-${timestamp}.mp4`;
 }
 
 function mergeLiveSession(current: LiveSessionRecord | null, next: LiveSessionRecord | null) {
@@ -95,7 +98,11 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const archiveFinalizedRef = useRef<Promise<void> | null>(null);
   const archiveFileNameRef = useRef<string | null>(null);
   const archiveFileHandleRef = useRef<LocalFileHandle | null>(null);
+  const archiveDirectoryRef = useRef<LocalDirectoryHandle | null>(null);
+  const archivePartNumberRef = useRef(1);
+  const archivePartStartedAtRef = useRef(0);
   const localSegmentUrlsRef = useRef(new Map<number, string>());
+  const localPartUrlsRef = useRef(new Map<string, string>());
   const sequenceRef = useRef(0);
   const segmentTimelineCursorRef = useRef(0);
   const segmentStartedAtClockRef = useRef(0);
@@ -119,9 +126,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [pausing, setPausing] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [localArchiveName, setLocalArchiveName] = useState<string | null>(null);
-  const [completedRecordingFile, setCompletedRecordingFile] = useState<File | null>(null);
-  const [uploadingRecording, setUploadingRecording] = useState(false);
-  const [recordingUploadProgress, setRecordingUploadProgress] = useState(0);
+  const [localParts, setLocalParts] = useState<LocalMatchVideoPart[]>([]);
   const [atLiveEdge, setAtLiveEdge] = useState(true);
   const [replayTarget, setReplayTarget] = useState<ReplayTarget | null>(null);
   const [playheadSeconds, setPlayheadSeconds] = useState(0);
@@ -132,6 +137,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [selectedMomentId, setSelectedMomentId] = useState<string | null>(null);
   const [busyMomentTypeId, setBusyMomentTypeId] = useState<string | null>(null);
   const [editingMoment, setEditingMoment] = useState<MomentRecord | null>(null);
+  const [exportingMomentId, setExportingMomentId] = useState<string | null>(null);
   const [editingMatch, setEditingMatch] = useState(false);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
@@ -164,6 +170,20 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   }, [refresh]);
 
   useEffect(() => {
+    let active = true;
+    getRememberedMatchVideoParts(matchId).then((parts) => {
+      if (!active) return;
+      for (const part of parts) {
+        if (!localPartUrlsRef.current.has(part.id)) localPartUrlsRef.current.set(part.id, URL.createObjectURL(part.file));
+      }
+      setLocalParts(parts);
+      segmentTimelineCursorRef.current = Math.max(segmentTimelineCursorRef.current, ...parts.map((part) => part.startTimeSeconds + part.durationSeconds), 0);
+      setPlayheadSeconds((current) => Math.max(current, segmentTimelineCursorRef.current));
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, [matchId]);
+
+  useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 500);
     return () => window.clearInterval(timer);
   }, []);
@@ -194,6 +214,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     for (const url of localSegmentUrlsRef.current.values()) URL.revokeObjectURL(url);
     localSegmentUrlsRef.current.clear();
+    for (const url of localPartUrlsRef.current.values()) URL.revokeObjectURL(url);
+    localPartUrlsRef.current.clear();
   }, []);
 
   useEffect(() => {
@@ -217,10 +239,26 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     void video.play().then(() => setRemotePlaybackNeedsAction(false)).catch(() => setRemotePlaybackNeedsAction(true));
   }, [atLiveEdge, remoteLiveStream]);
 
-  const readySegments = useMemo(
-    () => session?.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl).sort((a, b) => a.sequence - b.sequence) || [],
-    [session?.segments],
-  );
+  const readySegments = useMemo(() => {
+    const partSegments: LiveSegmentRecord[] = localParts.map((part) => ({
+      id: `local-part-${part.id}`,
+      sequence: part.partNumber * 1_000_000,
+      startedAtSeconds: part.startTimeSeconds,
+      durationSeconds: part.durationSeconds,
+      mimeType: part.file.type || "video/mp4",
+      fileSize: String(part.file.size),
+      status: "READY",
+      readyAt: new Date(part.savedAt).toISOString(),
+      playbackUrl: localPartUrlsRef.current.get(part.id) || null,
+      playbackUrlExpiresAt: null,
+    }));
+    const sessionSegments = session?.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl) || [];
+    const uncoveredSegments = sessionSegments.filter((segment) => !localParts.some((part) => {
+      const end = part.startTimeSeconds + part.durationSeconds;
+      return segment.startedAtSeconds >= part.startTimeSeconds - 0.05 && segment.startedAtSeconds < end - 0.05;
+    }));
+    return [...partSegments, ...uncoveredSegments].sort((a, b) => a.startedAtSeconds - b.startedAtSeconds || a.sequence - b.sequence);
+  }, [localParts, session?.segments]);
   const selectedSegment = readySegments.find((segment) => segment.id === replayTarget?.segmentId) || null;
   const availableEdgeSeconds = getReplayEdge(readySegments);
   const activeSegmentSeconds = recording && segmentStartedAtClockRef.current
@@ -406,13 +444,16 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
   const markMoment = useCallback(async (momentTypeId: string) => {
     if (!session || session.status !== "LIVE") return setNotice("Wait for the live session to start before tagging a moment.");
-    if (paused) return setNotice("Resume recording before tagging a new moment.");
+    if (!recording && !remoteLiveStream) return setNotice("Start the next recording part before tagging a new moment.");
+    if (paused) return setNotice("Start the next recording part before tagging a new moment.");
     const markedAtSeconds = atLiveEdge ? liveEdgeSeconds : playheadSeconds;
+    const recordedPart = localParts.find((part) => markedAtSeconds >= part.startTimeSeconds - 0.05 && markedAtSeconds <= part.startTimeSeconds + part.durationSeconds + 0.05);
+    const partStartedAtSeconds = recordedPart?.startTimeSeconds ?? archivePartStartedAtRef.current;
     setBusyMomentTypeId(momentTypeId);
     try {
       const saved = await apiFetch<MomentRecord>(`/api/matches/${matchId}/live/moments`, {
         method: "POST",
-        body: JSON.stringify({ liveSessionId: session.id, momentTypeId, markedAtSeconds, leadSeconds: 20 }),
+        body: JSON.stringify({ liveSessionId: session.id, momentTypeId, markedAtSeconds, leadSeconds: 20, partStartedAtSeconds }),
       });
       setMatch((current) => current ? { ...current, moments: [...current.moments, saved].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds), momentCount: current.momentCount + 1 } : current);
       setSelectedMomentId(saved.id);
@@ -422,7 +463,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     } finally {
       setBusyMomentTypeId(null);
     }
-  }, [atLiveEdge, liveEdgeSeconds, matchId, paused, playheadSeconds, session]);
+  }, [atLiveEdge, liveEdgeSeconds, localParts, matchId, paused, playheadSeconds, recording, remoteLiveStream, session]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -490,9 +531,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     }
   }
 
-  async function startLocalArchive(directory: LocalDirectoryHandle) {
+  async function startLocalArchive(directory: LocalDirectoryHandle, partNumber: number, startTimeSeconds: number) {
     if (!streamRef.current || !match) throw new Error("Connect the camera before creating the local recording.");
-    const fileName = localRecordingFileName(match.title);
+    const fileName = localRecordingFileName(match.title, partNumber);
     const fileHandle = await directory.getFileHandle(fileName, { create: true });
     const writer = await fileHandle.createWritable();
     const mimeType = supportedArchiveMimeType();
@@ -511,6 +552,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     archiveWriterRef.current = writer;
     archiveRecorderRef.current = archiveRecorder;
     archiveFileHandleRef.current = fileHandle;
+    archiveDirectoryRef.current = directory;
+    archivePartNumberRef.current = partNumber;
+    archivePartStartedAtRef.current = startTimeSeconds;
     archiveWriteChainRef.current = Promise.resolve();
     archiveFileNameRef.current = fileName;
     setLocalArchiveName(fileName);
@@ -541,15 +585,48 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     archiveRecorder.start(1_000);
   }
 
-  async function stopLocalArchive() {
+  async function stopLocalArchive(endTimeSeconds = segmentTimelineCursorRef.current) {
     const archiveRecorder = archiveRecorderRef.current;
     const finalization = archiveFinalizedRef.current;
     if (archiveRecorder && archiveRecorder.state !== "inactive") archiveRecorder.stop();
     if (finalization) await finalization;
     archiveFinalizedRef.current = null;
-    const completed = await archiveFileHandleRef.current?.getFile();
-    if (completed) setCompletedRecordingFile(completed);
-    return completed || null;
+    const fileHandle = archiveFileHandleRef.current;
+    const completed = await fileHandle?.getFile();
+    if (!completed || !fileHandle) return null;
+
+    const partNumber = archivePartNumberRef.current;
+    const startTimeSeconds = archivePartStartedAtRef.current;
+    const durationSeconds = Math.max(0.1, endTimeSeconds - startTimeSeconds);
+    let part: LocalMatchVideoPart;
+    try {
+      part = await rememberMatchVideoPart({
+        matchId,
+        partNumber,
+        startTimeSeconds,
+        durationSeconds,
+        fileName: completed.name,
+        file: completed,
+      }, fileHandle);
+    } catch {
+      part = {
+        id: `${matchId}:${partNumber}`,
+        matchId,
+        partNumber,
+        startTimeSeconds,
+        durationSeconds,
+        fileName: completed.name,
+        file: completed,
+        savedAt: Date.now(),
+      };
+    }
+    const previousUrl = localPartUrlsRef.current.get(part.id);
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    localPartUrlsRef.current.set(part.id, URL.createObjectURL(completed));
+    setLocalParts((current) => [...current.filter((item) => item.partNumber !== part.partNumber), part].sort((a, b) => a.partNumber - b.partNumber));
+    archiveFileHandleRef.current = null;
+    setLocalArchiveName(null);
+    return part;
   }
 
   async function startRealtimePublisher(activeSession: LiveSessionRecord) {
@@ -571,29 +648,36 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   }
 
   async function startLive() {
-    const directory = await chooseLocalRecordingFolder();
+    const directory = archiveDirectoryRef.current || await chooseLocalRecordingFolder();
     if (!directory) return;
     if (!streamRef.current) {
       await connectCamera();
       if (!streamRef.current) return;
     }
     try {
-      const next = await apiFetch<LiveSessionRecord>(`/api/matches/${matchId}/live`, { method: "POST", body: JSON.stringify({ sourceType: "BROWSER_CAMERA" }) });
-      for (const url of localSegmentUrlsRef.current.values()) URL.revokeObjectURL(url);
-      localSegmentUrlsRef.current.clear();
+      const next = await apiFetch<LiveSessionRecord>(`/api/matches/${matchId}/live`, {
+        method: "POST",
+        body: JSON.stringify({
+          sourceType: "BROWSER_CAMERA",
+          enableRealtime: process.env.NEXT_PUBLIC_LIVE_CLOUD_REPLAY_ENABLED === "true",
+        }),
+      });
       setSession(next);
       sequenceRef.current = Math.max(...next.segments.map((segment) => segment.sequence + 1), 0);
       fetchedSequenceRef.current = Math.max(...next.segments.map((segment) => segment.sequence), -1);
-      segmentTimelineCursorRef.current = getReplayEdge(next.segments.filter((segment) => segment.status === "READY"));
+      segmentTimelineCursorRef.current = Math.max(
+        getReplayEdge(next.segments.filter((segment) => segment.status === "READY")),
+        ...localParts.map((part) => part.startTimeSeconds + part.durationSeconds),
+        0,
+      );
       segmentStartedAtClockRef.current = Date.now();
       recordingRef.current = true;
       setRecording(true);
       setPaused(false);
-      setCompletedRecordingFile(null);
       setAtLiveEdge(true);
       setReplayTarget(null);
       try {
-        await startLocalArchive(directory);
+        await startLocalArchive(directory, localParts.length + 1, segmentTimelineCursorRef.current);
       } catch (archiveError) {
         recordingRef.current = false;
         setRecording(false);
@@ -601,6 +685,11 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         setSession(null);
         setNotice(archiveError instanceof Error ? archiveError.message : "The local recording file could not be created.");
         return;
+      }
+      if (localParts.length === 0 && match?.firstHalfStartSeconds === null) {
+        await saveAutomaticPeriodMarker("firstHalfStartSeconds", segmentTimelineCursorRef.current);
+      } else if (localParts.length === 1 && match?.secondHalfStartSeconds === null) {
+        await saveAutomaticPeriodMarker("secondHalfStartSeconds", segmentTimelineCursorRef.current);
       }
       void recordNextSegment(next);
       const realtimeWarning = await startRealtimePublisher(next);
@@ -618,7 +707,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     const startedAtSeconds = segmentTimelineCursorRef.current;
     segmentStartedAtClockRef.current = Date.now();
     const mimeType = supportedSegmentMimeType();
-    const cloudReplayEnabled = shouldUploadReplayFromOrigin(window.location);
+    const cloudReplayEnabled = process.env.NEXT_PUBLIC_LIVE_CLOUD_REPLAY_ENABLED === "true" && shouldUploadReplayFromOrigin(window.location);
     const preparation = cloudReplayEnabled
       ? apiFetch<PreparedSegment>(`/api/live-sessions/${activeSession.id}/segments`, {
           method: "POST",
@@ -707,11 +796,6 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       recorderTimerRef.current = null;
     }
     try {
-      const archiveRecorder = archiveRecorderRef.current;
-      if (!archiveRecorder || archiveRecorder.state !== "recording") throw new Error("The complete match recording is not available to pause.");
-      const archivePaused = new Promise<void>((resolve) => archiveRecorder.addEventListener("pause", () => resolve(), { once: true }));
-      archiveRecorder.requestData();
-      archiveRecorder.pause();
       const segmentRecorder = recorderRef.current;
       if (segmentRecorder?.state === "recording") {
         await new Promise<void>((resolve) => {
@@ -719,26 +803,27 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
           segmentRecorder.stop();
         });
       }
-      await archivePaused;
-      await archiveWriteChainRef.current;
       closeWebRtcSession(publisherSessionRef.current);
       publisherSessionRef.current = null;
+      const completedPart = await stopLocalArchive(segmentTimelineCursorRef.current);
+      if (!completedPart) throw new Error("The recording part could not be finalized.");
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      setCameraConnected(false);
       setPaused(true);
-      setAtLiveEdge(true);
-      setPlayheadSeconds(segmentTimelineCursorRef.current);
-      setNotice(`Recording paused at ${formatTime(segmentTimelineCursorRef.current)}. The interval will not be included in the MP4.`);
-    } catch (error) {
-      const archiveState = archiveRecorderRef.current?.state;
-      if (archiveState === "recording" && session) {
-        recordingRef.current = true;
-        setRecording(true);
-        if (!recorderRef.current || recorderRef.current.state === "inactive") void recordNextSegment(session);
-      } else {
-        recordingRef.current = false;
-        setRecording(false);
-        setPaused(archiveState === "paused");
+      setAtLiveEdge(false);
+      setPlayheadSeconds(completedPart.startTimeSeconds);
+      setReplayTarget({ segmentId: `local-part-${completedPart.id}`, offsetSeconds: 0, autoplay: false, command: ++replayCommandRef.current });
+      if (completedPart.partNumber === 1 && match?.firstHalfEndSeconds === null) {
+        void saveAutomaticPeriodMarker("firstHalfEndSeconds", segmentTimelineCursorRef.current);
       }
-      setNotice(error instanceof Error ? error.message : "The recording could not be paused.");
+      const partLabel = completedPart.partNumber === 1 ? "First half" : completedPart.partNumber === 2 ? "Second half" : `Part ${completedPart.partNumber}`;
+      setNotice(`${partLabel} saved as ${completedPart.fileName}. All tagged clips remain available during the interval.`);
+    } catch (error) {
+      recordingRef.current = false;
+      setRecording(false);
+      setPaused(Boolean(localParts.length || archiveFileHandleRef.current === null));
+      setNotice(error instanceof Error ? error.message : "The recording part could not be finalized.");
     } finally {
       setPausing(false);
     }
@@ -746,15 +831,13 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
   async function resumeRecording() {
     if (!paused || !session || pausing || stopping) return;
-    const archiveRecorder = archiveRecorderRef.current;
-    if (!archiveRecorder || archiveRecorder.state !== "paused" || !streamRef.current) {
-      setNotice("This recording can no longer be resumed. End the live session and start a new recording file.");
-      return;
-    }
+    const directory = archiveDirectoryRef.current || await chooseLocalRecordingFolder();
+    if (!directory) return;
+    if (!streamRef.current) await connectCamera();
+    if (!streamRef.current) return;
     try {
-      const resumed = new Promise<void>((resolve) => archiveRecorder.addEventListener("resume", () => resolve(), { once: true }));
-      archiveRecorder.resume();
-      await resumed;
+      const partNumber = localParts.length + 1;
+      await startLocalArchive(directory, partNumber, segmentTimelineCursorRef.current);
       recordingRef.current = true;
       segmentStartedAtClockRef.current = Date.now();
       setRecording(true);
@@ -762,33 +845,17 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       setAtLiveEdge(true);
       setReplayTarget(null);
       void recordNextSegment(session);
+      if (partNumber === 2 && match?.secondHalfStartSeconds === null) {
+        await saveAutomaticPeriodMarker("secondHalfStartSeconds", segmentTimelineCursorRef.current);
+      }
       const realtimeWarning = await startRealtimePublisher(session);
       setNotice(realtimeWarning
-        ? `Recording resumed at ${formatTime(segmentTimelineCursorRef.current)}. ${realtimeWarning}`
-        : `Recording resumed at ${formatTime(segmentTimelineCursorRef.current)} in the same MP4 file.`);
+        ? `Part ${partNumber} started at ${formatTime(segmentTimelineCursorRef.current)} in a new local MP4. ${realtimeWarning}`
+        : `Part ${partNumber} started at ${formatTime(segmentTimelineCursorRef.current)} in a new local MP4.`);
     } catch (error) {
       recordingRef.current = false;
       setRecording(false);
-      setNotice(error instanceof Error ? error.message : "The recording could not be resumed.");
-    }
-  }
-
-  async function uploadFullRecording() {
-    if (!completedRecordingFile || uploadingRecording) return;
-    setUploadingRecording(true);
-    setRecordingUploadProgress(0);
-    try {
-      const result = await uploadMatchVideo(matchId, completedRecordingFile, ({ progress, detail }) => {
-        setRecordingUploadProgress(progress);
-        setNotice(`${detail} ${Math.round(progress * 100)}%`);
-      });
-      const savedMatch = await apiFetch<MatchDetail>(`/api/matches/${matchId}`);
-      setMatch(savedMatch);
-      setNotice(result.resumed ? "The complete match upload resumed and finished successfully." : "The complete match video was uploaded successfully.");
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The complete match video could not be uploaded.");
-    } finally {
-      setUploadingRecording(false);
+      setNotice(error instanceof Error ? error.message : "The next recording part could not be started.");
     }
   }
 
@@ -802,7 +869,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     if (recorder?.state === "recording") await new Promise<void>((resolve) => { recorder.addEventListener("stop", () => resolve(), { once: true }); recorder.stop(); });
     closeWebRtcSession(publisherSessionRef.current);
     publisherSessionRef.current = null;
-    const finalizationResults = await Promise.allSettled([stopLocalArchive(), ...pendingUploadsRef.current]);
+    const finalizationResults = await Promise.allSettled([stopLocalArchive(segmentTimelineCursorRef.current), ...pendingUploadsRef.current]);
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     setCameraConnected(false);
@@ -813,9 +880,17 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       const latest = ended.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl).at(-1);
       if (latest) openSegment(latest, 0, false, false);
       const localFailed = finalizationResults[0]?.status === "rejected";
+      const completedPart = finalizationResults[0]?.status === "fulfilled" ? finalizationResults[0].value : null;
+      const lastPartNumber = completedPart?.partNumber || localParts.at(-1)?.partNumber || 0;
+      if (completedPart) {
+        setReplayTarget({ segmentId: `local-part-${completedPart.id}`, offsetSeconds: 0, autoplay: false, command: ++replayCommandRef.current });
+        setPlayheadSeconds(completedPart.startTimeSeconds);
+      }
+      if (lastPartNumber === 1 && match?.firstHalfEndSeconds === null) void saveAutomaticPeriodMarker("firstHalfEndSeconds", segmentTimelineCursorRef.current);
+      if (lastPartNumber >= 2 && match?.secondHalfEndSeconds === null) void saveAutomaticPeriodMarker("secondHalfEndSeconds", segmentTimelineCursorRef.current);
       setNotice(localFailed
-        ? "The live session ended, but the local video file could not be finalized. The cloud DVR segments remain available."
-        : `The live session ended. ${archiveFileNameRef.current || "The local video"} is saved and can be uploaded to R2.`);
+        ? "The match ended, but the current local recording part could not be finalized. Previously completed parts remain available."
+        : `The match ended. ${Math.max(lastPartNumber, localParts.length)} local recording part${Math.max(lastPartNumber, localParts.length) === 1 ? "" : "s"} saved.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The live session could not be stopped cleanly.");
     } finally {
@@ -862,6 +937,43 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     setSelectedMomentId(moment.id);
     setPreviewEnd(moment.endTimeSeconds);
     if (!seekVirtual(moment.startTimeSeconds, true)) setNotice("This part of the recording is not available yet.");
+  }
+
+  async function exportMoment(moment: MomentRecord) {
+    if (!match || exportingMomentId) return;
+    const part = localParts.find((item) => moment.startTimeSeconds >= item.startTimeSeconds - 0.05 && moment.endTimeSeconds <= item.startTimeSeconds + item.durationSeconds + 0.05);
+    if (!part) {
+      setNotice("Finish the current recording part before exporting this moment.");
+      return;
+    }
+
+    const localMoment = {
+      ...moment,
+      startTimeSeconds: Math.max(0, moment.startTimeSeconds - part.startTimeSeconds),
+      endTimeSeconds: Math.max(0.1, moment.endTimeSeconds - part.startTimeSeconds),
+    };
+    const fallbackUrl = localPartUrlsRef.current.get(part.id) || URL.createObjectURL(part.file);
+    const ownsFallbackUrl = !localPartUrlsRef.current.has(part.id);
+    const exporter = new SmartVideoExportSession(part.file);
+    setExportingMomentId(moment.id);
+    setNotice(`Preparing ${moment.momentType.name} for export…`);
+    try {
+      const result = await exporter.exportMoment({
+        match,
+        moment: localMoment,
+        quality: "high",
+        sourceUrlFallback: fallbackUrl,
+        onStatus: (message) => setNotice(message),
+      });
+      downloadBlob(result.blob, result.fileName);
+      setNotice(`${moment.momentType.name} exported successfully.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "This moment could not be exported.");
+    } finally {
+      exporter.dispose();
+      if (ownsFallbackUrl) URL.revokeObjectURL(fallbackUrl);
+      setExportingMomentId(null);
+    }
   }
 
   async function updateMoment(input: Record<string, unknown>) {
@@ -912,6 +1024,15 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     }
   }
 
+  async function saveAutomaticPeriodMarker(key: PeriodMarkerKey, seconds: number) {
+    try {
+      const saved = await apiFetch<MatchDetail>(`/api/matches/${matchId}`, { method: "PATCH", body: JSON.stringify({ [key]: roundTime(seconds) }) });
+      setMatch(saved);
+    } catch {
+      // Automatic period markers are a convenience and must never interrupt recording.
+    }
+  }
+
   async function saveMatch(input: Record<string, unknown>) {
     const saved = await apiFetch<MatchDetail>(`/api/matches/${matchId}`, { method: "PATCH", body: JSON.stringify(input) });
     setMatch(saved);
@@ -941,13 +1062,13 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         <button type="button" title="Edit match" aria-label="Edit match" onClick={() => setEditingMatch(true)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-white/[.06] hover:text-white"><Settings2 size={13} /></button>
       </div>
       <div className="order-3 flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto px-2 py-1.5 md:order-none" aria-label="Tag the previous 20 seconds">
-        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; return <button key={type.id} type="button" disabled={!activeLive || paused || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 min-w-[6rem] shrink-0 items-center justify-between gap-2 rounded-md border px-2 text-left transition ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0"><span className="block truncate text-[9px] font-bold" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 block text-[8px] text-slate-600">{busy ? "Saving…" : paused ? "Recording paused" : "Previous 20s"}</span></span><kbd className="rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300">{type.defaultShortcut || "—"}</kbd></button>; })}
+        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; const taggingUnavailable = !activeLive || paused || (!recording && !remoteLiveStream); return <button key={type.id} type="button" disabled={taggingUnavailable || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 min-w-[6rem] shrink-0 items-center justify-between gap-2 rounded-md border px-2 text-left transition ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0"><span className="block truncate text-[9px] font-bold" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 block text-[8px] text-slate-600">{busy ? "Saving…" : taggingUnavailable ? "Recording stopped" : "Previous 20s"}</span></span><kbd className="rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300">{type.defaultShortcut || "—"}</kbd></button>; })}
       </div>
       <div className="ml-auto flex min-w-0 shrink-0 items-center justify-end gap-1 border-l border-white/10 px-1.5 max-md:w-full max-md:border-b max-md:border-l-0">
-        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-36 sm:flex-none" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} disabled={recording || paused}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
-        {(recording || paused || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : paused ? "Paused" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : paused ? "File paused" : "Local copy"}</Badge> : null}
-        <Button size="icon" className="h-8 w-8" title={cameraConnected ? "Reconnect camera" : "Connect camera"} onClick={() => void connectCamera()} disabled={recording || paused}><Camera size={13} /></Button>
-        {!activeLive ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping || uploadingRecording}><Radio size={12} />Start live</Button>{completedRecordingFile ? <Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void uploadFullRecording()} disabled={uploadingRecording}>{uploadingRecording ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />}{uploadingRecording ? `Uploading ${Math.round(recordingUploadProgress * 100)}%` : "Upload full video"}</Button> : null}</> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Pausing…" : "Pause"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End live"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Resume</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End live"}</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || stopping}><Radio size={12} />{canStartCameraRecording ? "Resume in new file" : "Live running"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || stopping}><CircleStop size={12} />End live</Button></>}
+        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-36 sm:flex-none" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} disabled={recording}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
+        {(recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : paused && localParts.length ? <Badge className="hidden border-amber-300/25 bg-amber-300/10 text-[9px] text-amber-100 2xl:inline-flex">{localParts.length} part{localParts.length === 1 ? "" : "s"} saved</Badge> : null}
+        <Button size="icon" className="h-8 w-8" title={cameraConnected ? "Reconnect camera" : "Connect camera"} onClick={() => void connectCamera()} disabled={recording}><Camera size={13} /></Button>
+        {!activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping}><Radio size={12} />{localParts.length ? "Start next part" : "Start live"}</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving part…" : "End part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End match"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Start next part</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End match</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || stopping}><Radio size={12} />Start next part</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || stopping}><CircleStop size={12} />End match</Button></>}
       </div>
     </Panel>
 
@@ -956,9 +1077,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     <div className="grid min-h-0 flex-1 items-stretch gap-2 xl:grid-cols-[18rem_minmax(0,1fr)]">
       <Panel className="order-2 flex min-h-0 min-w-0 flex-col overflow-hidden">
         <div className="relative aspect-video min-h-72 shrink-0 bg-black xl:aspect-auto xl:min-h-0 xl:flex-1">
-          {atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : "Connect the match camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">Recording continues while every staff member controls an independent replay.</p></div>}
+          {atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{paused ? "Recording part saved" : activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : "Connect the match camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">{paused ? "Select a tagged moment to review it, or start the next recording part." : "Recording continues while you independently control replay."}</p></div>}
           {showingRemoteLive && remotePlaybackNeedsAction ? <button type="button" onClick={() => void remoteLiveVideoRef.current?.play()} className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm font-semibold text-white"><span className="rounded-lg border border-cyan-300/35 bg-pitch-950/90 px-4 py-3"><Play size={16} className="mr-2 inline" />Start live video</span></button> : null}
-          {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${paused ? "bg-amber-600" : "bg-red-600"}`}>{paused ? "Ⅱ PAUSED" : "● RECORDING"}</span> : null}
+          {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${paused ? "bg-amber-600" : "bg-red-600"}`}>{paused ? "INTERVAL · PART SAVED" : "● RECORDING"}</span> : null}
           {activeLive ? <span className={`absolute right-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold ${atLiveEdge ? "bg-cyan-300 text-slate-950" : "bg-slate-900/85 text-cyan-100"}`}>{atLiveEdge ? "LIVE" : `REPLAY · ${formatTime(behindLive)} behind`}</span> : null}
         </div>
         <div className="shrink-0 border-t border-white/10 bg-pitch-950/90 p-2">
@@ -983,7 +1104,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
       <Panel className="order-1 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
         <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Tagged moments</p><p className="mt-1 text-xs text-slate-400">{match.moments.length} in the recording</p></div><Badge title={liveViewers.map((viewer) => `${viewer.user.name} · ${viewer.atLiveEdge ? "live" : "replay"}`).join("\n")}><Users size={11} className="mr-1" />{liveViewers.length || (account ? 1 : 0)}</Badge></div><p className="mt-2 text-[10px] leading-4 text-slate-500">Select a row to review it without stopping the recording.</p></div>
-        <div className="min-h-0 flex-1 overflow-y-auto">{match.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Tagged moments will appear here.</p> : match.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}${moment.createdBy ? ` · ${moment.createdBy.name}` : ""}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button><button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] text-cyan-100" onClick={() => setEditingMoment(moment)}><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removeMoment(moment)}><Trash2 size={11} />Delete</button>{moment.notes ? <p className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] leading-4 text-amber-200">{moment.notes}</p> : null}</div>)}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto">{match.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Tagged moments will appear here.</p> : match.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}${moment.createdBy ? ` · ${moment.createdBy.name}` : ""}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button><button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button><button type="button" className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-violet-300/25 bg-violet-300/10 text-violet-100 hover:bg-violet-300/20 disabled:cursor-wait disabled:opacity-40" onClick={() => void exportMoment(moment)} disabled={Boolean(exportingMomentId)} aria-label={`Export ${moment.momentType.name}`} title="Export this moment as MP4">{exportingMomentId === moment.id ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] text-cyan-100" onClick={() => setEditingMoment(moment)}><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removeMoment(moment)}><Trash2 size={11} />Delete</button>{moment.notes ? <p className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] leading-4 text-amber-200">{moment.notes}</p> : null}</div>)}</div>
       </Panel>
     </div>
 
