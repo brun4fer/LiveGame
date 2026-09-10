@@ -8,7 +8,7 @@ This is the complete client user guide. The interface is in English, so button a
 
 1. [Recommended equipment](#recommended-equipment)
 2. [Accounts and team access](#accounts-and-team-access)
-3. [Management access](#management-access)
+3. [Sign-in access](#sign-in-access)
 4. [Prepare the application](#prepare-the-application)
 5. [Create and manage a match](#create-and-manage-a-match)
 6. [Record a match live](#record-a-match-live)
@@ -80,26 +80,11 @@ Live Game detects when other staff members are using the workspace. The warning 
 
 Each person controls their own replay position. One person rewinding, pausing or selecting a moment does not move another person's video.
 
-## Management access
+## Sign-in access
 
-Sensitive areas are protected by a separate management password:
+Only the initial account sign-in is currently required. After signing in and joining a workspace, staff can open all Live Game areas without entering another password.
 
-- **Matches**
-- **New match**
-- **Maintenance**
-- **Settings**
-- Match and moment editing
-
-Staff may access operational areas such as **Maps**, **Reports**, **Playlists** and **Help** without unlocking management access.
-
-To change the management password:
-
-1. Open **Settings**.
-2. Find **Security** → **Management password**.
-3. Enter the current password and the new password twice.
-4. Select **Change password**.
-
-Changing it locks management access in other open sessions. Use at least eight characters with at least one letter and one number.
+Each staff member should use their own account. Always select **Sign out** when leaving a shared device.
 
 ## Prepare the application
 

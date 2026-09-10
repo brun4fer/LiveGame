@@ -43,7 +43,7 @@ export default function RegisterPage() {
       <span className="flex h-12 w-12 items-center justify-center rounded-lg bg-cyan-300/10 text-cyan-200"><UserPlus /></span>
       <p className="mt-5 text-xs font-medium uppercase tracking-[.24em] text-cyan-200/80">Live Game</p>
       <h1 className="mt-2 text-2xl font-semibold text-white">Create your account</h1>
-      <p className="mt-2 text-sm leading-6 text-slate-400">Create a private account for your team. After registration, you will choose the team name and configure the management password.</p>
+      <p className="mt-2 text-sm leading-6 text-slate-400">Create a private account for your team. After registration, you can create a team or join an existing workspace.</p>
 
       {error ? <div role="alert" className="mt-5 rounded-lg border border-red-400/25 bg-red-500/10 p-3 text-sm text-red-100">{error}</div> : null}
 

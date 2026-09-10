@@ -1,6 +1,7 @@
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { cookies } from "next/headers";
 
+import { isManagementPasswordEnabled } from "@/lib/management-access";
 import { prisma } from "@/lib/prisma";
 
 export const SESSION_COOKIE = "live_game_session";
@@ -99,6 +100,7 @@ export async function requireWorkspace() {
 
 export async function requireManagementWorkspace() {
   const account = await requireWorkspace();
+  if (!isManagementPasswordEnabled()) return account;
   if (!account.workspace.managementPasswordHash) {
     throw new ManagementAccessError("Create the management password before accessing this area.");
   }

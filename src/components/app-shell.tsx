@@ -10,6 +10,7 @@ import { Button, Label, Panel } from "@/components/ui";
 import { cn } from "@/lib/cn";
 import type { AccountPayload } from "@/lib/domain";
 import { apiFetch } from "@/lib/http";
+import { isManagementPasswordEnabled } from "@/lib/management-access";
 
 const links = [
   { href: "/", label: "Matches", icon: Home, protected: true },
@@ -23,6 +24,7 @@ const links = [
 ];
 
 const PUBLIC_PATHS = ["/login", "/register", "/change-password", "/onboarding"];
+const MANAGEMENT_PASSWORD_ENABLED = isManagementPasswordEnabled();
 const PRESENCE_CLIENT_KEY = "live-game-presence-client";
 type Presence = { activeElsewhere: boolean; otherActiveSessions: number };
 
@@ -52,7 +54,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     if (!isPublic) {
       apiFetch<AccountPayload>("/api/account").then((next) => {
         setAccount(next);
-        if (!next.managementAccess.configured || (isManagementPath(pathname) && !next.managementAccess.unlocked)) setShowManagementAccess(true);
+        if (MANAGEMENT_PASSWORD_ENABLED && (!next.managementAccess.configured || (isManagementPath(pathname) && !next.managementAccess.unlocked))) setShowManagementAccess(true);
       }).catch(() => undefined);
     }
   }, [isPublic, pathname]);
@@ -126,7 +128,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                     key={href}
                     href={href}
                     onClick={(event) => {
-                      if (needsManagement && account && !account.managementAccess.unlocked) {
+                      if (MANAGEMENT_PASSWORD_ENABLED && needsManagement && account && !account.managementAccess.unlocked) {
                         event.preventDefault();
                         setPendingHref(href);
                         setShowManagementAccess(true);
@@ -139,7 +141,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   >
                     <Icon size={16} />
                     <span className="hidden sm:inline">{label}</span>
-                    {needsManagement && account && !account.managementAccess.unlocked ? <LockKeyhole size={10} className="text-amber-300" aria-label="Locked" /> : null}
+                    {MANAGEMENT_PASSWORD_ENABLED && needsManagement && account && !account.managementAccess.unlocked ? <LockKeyhole size={10} className="text-amber-300" aria-label="Locked" /> : null}
                   </Link>
                 );
               })}
@@ -169,7 +171,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </div>
         </Panel>
       </div> : null}
-      {showManagementAccess && account ? <ManagementAccessDialog configured={account.managementAccess.configured} canDismiss={!isManagementPath(pathname)} onDismiss={() => { setShowManagementAccess(false); setPendingHref(null); }} onUnlocked={() => {
+      {MANAGEMENT_PASSWORD_ENABLED && showManagementAccess && account ? <ManagementAccessDialog configured={account.managementAccess.configured} canDismiss={!isManagementPath(pathname)} onDismiss={() => { setShowManagementAccess(false); setPendingHref(null); }} onUnlocked={() => {
         setAccount({ ...account, managementAccess: { configured: true, unlocked: true } });
         setShowManagementAccess(false);
         const target = pendingHref;

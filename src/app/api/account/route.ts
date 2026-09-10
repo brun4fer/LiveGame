@@ -1,9 +1,11 @@
 import { requireAccount } from "@/lib/auth";
 import { handleApiError } from "@/lib/api";
+import { isManagementPasswordEnabled } from "@/lib/management-access";
 
 export async function GET() {
   try {
     const { user, workspace, session } = await requireAccount();
+    const managementPasswordEnabled = isManagementPasswordEnabled();
     return Response.json({
       id: user.id,
       name: user.name,
@@ -11,10 +13,9 @@ export async function GET() {
       teamName: workspace?.name ?? null,
       needsOnboarding: !workspace,
       managementAccess: {
-        configured: Boolean(workspace?.managementPasswordHash),
-        unlocked: Boolean(workspace?.managementPasswordHash && session.managementAccessVersion === workspace.managementPasswordVersion)
+        configured: !managementPasswordEnabled || Boolean(workspace?.managementPasswordHash),
+        unlocked: !managementPasswordEnabled || Boolean(workspace?.managementPasswordHash && session.managementAccessVersion === workspace.managementPasswordVersion)
       }
     });
   } catch (error) { return handleApiError(error); }
 }
-

@@ -9,8 +9,10 @@ import { MediaLibraryLinkPanel } from "@/components/media-library-link-panel";
 import { TeamAccessPanel } from "@/components/team-access-panel";
 import type { MomentTypeRecord, SettingsPayload, SubMomentTypeRecord } from "@/lib/domain";
 import { apiFetch } from "@/lib/http";
+import { isManagementPasswordEnabled } from "@/lib/management-access";
 
 const emptyMoment = { name: "", code: "", color: "#2dd66f", defaultShortcut: "", allowedSubmomentIds: [] as string[] };
+const MANAGEMENT_PASSWORD_ENABLED = isManagementPasswordEnabled();
 const emptySubmoment = {
   name: "",
   code: "",
@@ -173,7 +175,7 @@ export function SettingsClient() {
         <div className="rounded-xl border border-red-400/25 bg-red-500/10 p-3 text-sm text-red-100">{error}</div>
       ) : null}
 
-      <ManagementPasswordPanel />
+      {MANAGEMENT_PASSWORD_ENABLED ? <ManagementPasswordPanel /> : null}
 
       <TeamAccessPanel />
 
