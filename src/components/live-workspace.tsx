@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Loader2, Pause, Pencil, Play, Radio, RotateCcw, Settings2, Trash2, Users, Video, X } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Loader2, Pause, Pencil, Play, Radio, RotateCcw, Settings2, Trash2, Users, Video, X } from "lucide-react";
 
 import { MatchEditDialog } from "@/components/match-edit-dialog";
 import { MomentEditDialog } from "@/components/moment-edit-dialog";
@@ -110,6 +110,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const replayCommandRef = useRef(0);
   const pendingUploadsRef = useRef(new Set<Promise<void>>());
   const presenceStateRef = useRef({ atLiveEdge: true, playheadSeconds: 0 });
+  const cameraStreamGenerationRef = useRef(0);
+  const cameraMuteTimerRef = useRef<number | null>(null);
+  const cameraLossHandlingRef = useRef(false);
 
   const [match, setMatch] = useState<MatchDetail | null>(null);
   const [settings, setSettings] = useState<SettingsPayload | null>(null);
@@ -118,6 +121,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState("");
   const [cameraConnected, setCameraConnected] = useState(false);
+  const [cameraProblem, setCameraProblem] = useState<string | null>(null);
   const [remoteLiveStream, setRemoteLiveStream] = useState<MediaStream | null>(null);
   const [remotePlaybackNeedsAction, setRemotePlaybackNeedsAction] = useState(false);
   const [realtimeConnecting, setRealtimeConnecting] = useState(false);
@@ -204,6 +208,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
   useEffect(() => () => {
     recordingRef.current = false;
+    cameraStreamGenerationRef.current += 1;
+    if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
     if (recorderTimerRef.current !== null) window.clearTimeout(recorderTimerRef.current);
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
     if (archiveRecorderRef.current && archiveRecorderRef.current.state !== "inactive") archiveRecorderRef.current.stop();
@@ -491,17 +497,120 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [atLiveEdge, currentTime, editingMatch, editingMoment, markMoment, playing, seekVirtual, settings?.momentTypes, togglePlayback]);
 
-  async function connectCamera() {
-    if (!navigator.mediaDevices?.getUserMedia) return setNotice("Camera capture is not supported in this browser.");
+  function monitorCameraStream(stream: MediaStream) {
+    const videoTrack = stream.getVideoTracks()[0];
+    if (!videoTrack) return;
+    const generation = ++cameraStreamGenerationRef.current;
+    const isCurrentStream = () => generation === cameraStreamGenerationRef.current && streamRef.current === stream;
+
+    videoTrack.addEventListener("ended", () => {
+      if (isCurrentStream()) void handleCameraLoss("The camera connection was lost. Check the HDMI, capture card and USB cables.");
+    });
+    videoTrack.addEventListener("mute", () => {
+      if (!isCurrentStream()) return;
+      if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
+      cameraMuteTimerRef.current = window.setTimeout(() => {
+        cameraMuteTimerRef.current = null;
+        if (isCurrentStream() && videoTrack.muted) {
+          void handleCameraLoss("The camera stopped sending images. Check the HDMI signal and capture card.");
+        }
+      }, 2_500);
+    });
+    videoTrack.addEventListener("unmute", () => {
+      if (!isCurrentStream()) return;
+      if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
+      cameraMuteTimerRef.current = null;
+    });
+  }
+
+  async function handleCameraLoss(message: string) {
+    if (cameraLossHandlingRef.current || !streamRef.current) return;
+    cameraLossHandlingRef.current = true;
+    const failedStream = streamRef.current;
+    const wasRecording = recordingRef.current;
+    cameraStreamGenerationRef.current += 1;
+    if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
+    cameraMuteTimerRef.current = null;
+    setCameraConnected(false);
+    setCameraProblem(wasRecording ? `${message} Saving the current recording part…` : message);
+
+    if (!wasRecording) {
+      failedStream.getTracks().forEach((track) => track.stop());
+      if (streamRef.current === failedStream) streamRef.current = null;
+      cameraLossHandlingRef.current = false;
+      return;
+    }
+
+    recordingRef.current = false;
+    setRecording(false);
+    setPausing(true);
+    if (recorderTimerRef.current !== null) {
+      window.clearTimeout(recorderTimerRef.current);
+      recorderTimerRef.current = null;
+    }
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: deviceId ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } } : { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
-        audio: true,
-      });
-      streamRef.current?.getTracks().forEach((track) => track.stop());
+      const segmentRecorder = recorderRef.current;
+      if (segmentRecorder?.state === "recording") {
+        await new Promise<void>((resolve) => {
+          segmentRecorder.addEventListener("stop", () => resolve(), { once: true });
+          segmentRecorder.stop();
+        });
+      }
+      closeWebRtcSession(publisherSessionRef.current);
+      publisherSessionRef.current = null;
+      const completedPart = await stopLocalArchive(segmentTimelineCursorRef.current);
+      failedStream.getTracks().forEach((track) => track.stop());
+      if (streamRef.current === failedStream) streamRef.current = null;
+      setPaused(true);
+      setAtLiveEdge(false);
+      if (completedPart) {
+        setPlayheadSeconds(completedPart.startTimeSeconds);
+        setReplayTarget({ segmentId: `local-part-${completedPart.id}`, offsetSeconds: 0, autoplay: false, command: ++replayCommandRef.current });
+        setCameraProblem(`${message} Part ${completedPart.partNumber} was preserved as ${completedPart.fileName}. Secure the connection, then reconnect and continue.`);
+      } else {
+        setCameraProblem(`${message} Secure the connection, then reconnect and continue. Previously completed parts remain available.`);
+      }
+    } catch (error) {
+      failedStream.getTracks().forEach((track) => track.stop());
+      if (streamRef.current === failedStream) streamRef.current = null;
+      setPaused(true);
+      setCameraProblem(`${message} ${error instanceof Error ? error.message : "The current part could not be finalized cleanly."} Previously completed parts remain available.`);
+    } finally {
+      setPausing(false);
+      cameraLossHandlingRef.current = false;
+    }
+  }
+
+  async function connectCamera() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setNotice("Camera capture is not supported in this browser.");
+      return false;
+    }
+    cameraStreamGenerationRef.current += 1;
+    if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
+    cameraMuteTimerRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    setCameraConnected(false);
+    try {
+      const defaultVideo = { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: deviceId ? { ...defaultVideo, deviceId: { exact: deviceId } } : defaultVideo,
+          audio: true,
+        });
+      } catch (firstError) {
+        const canRetryDefault = deviceId && firstError instanceof DOMException && ["NotFoundError", "OverconstrainedError", "NotReadableError"].includes(firstError.name);
+        if (!canRetryDefault) throw firstError;
+        stream = await navigator.mediaDevices.getUserMedia({ video: defaultVideo, audio: true });
+      }
       streamRef.current = stream;
+      monitorCameraStream(stream);
       if (cameraVideoRef.current) cameraVideoRef.current.srcObject = stream;
       setCameraConnected(true);
+      setCameraProblem(null);
       setAtLiveEdge(true);
       setReplayTarget(null);
       const available = await navigator.mediaDevices.enumerateDevices();
@@ -509,8 +618,12 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       const activeDevice = stream.getVideoTracks()[0]?.getSettings().deviceId;
       if (activeDevice) setDeviceId(activeDevice);
       setNotice("Camera connected. Start the live session when the match feed is ready.");
+      return true;
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The camera could not be opened.");
+      const message = error instanceof Error ? error.message : "The camera could not be opened.";
+      setNotice(message);
+      setCameraProblem(`The camera could not be reconnected. ${message} Check the cable and try again.`);
+      return false;
     }
   }
 
@@ -674,6 +787,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       recordingRef.current = true;
       setRecording(true);
       setPaused(false);
+      setCameraProblem(null);
       setAtLiveEdge(true);
       setReplayTarget(null);
       try {
@@ -842,6 +956,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       segmentStartedAtClockRef.current = Date.now();
       setRecording(true);
       setPaused(false);
+      setCameraProblem(null);
       setAtLiveEdge(true);
       setReplayTarget(null);
       void recordNextSegment(session);
@@ -1067,10 +1182,32 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       <div className="ml-auto flex min-w-0 shrink-0 items-center justify-end gap-1 border-l border-white/10 px-1.5 max-md:w-full max-md:border-b max-md:border-l-0">
         <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-36 sm:flex-none" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} disabled={recording}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
         {(recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : paused && localParts.length ? <Badge className="hidden border-amber-300/25 bg-amber-300/10 text-[9px] text-amber-100 2xl:inline-flex">{localParts.length} part{localParts.length === 1 ? "" : "s"} saved</Badge> : null}
-        <Button size="icon" className="h-8 w-8" title={cameraConnected ? "Reconnect camera" : "Connect camera"} onClick={() => void connectCamera()} disabled={recording}><Camera size={13} /></Button>
-        {!activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping}><Radio size={12} />{localParts.length ? "Start next part" : "Start live"}</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving part…" : "End part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End match"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Start next part</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End match</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || stopping}><Radio size={12} />Start next part</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || stopping}><CircleStop size={12} />End match</Button></>}
+        <Button
+          size="icon"
+          className="h-8 w-8"
+          title={recording ? "Preserve this part before reconnecting the camera" : paused ? "Reconnect the camera and continue recording" : cameraConnected ? "Reconnect camera" : "Connect camera"}
+          onClick={() => recording
+            ? void handleCameraLoss("Camera reconnection requested.")
+            : paused && activeLive
+              ? void resumeRecording()
+              : void connectCamera()}
+          disabled={pausing || stopping}
+        ><Camera size={13} /></Button>
+        {!activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping}><Radio size={12} />{localParts.length ? "Start next part" : "Start live"}</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving part…" : "End part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End match"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Start next part</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End match</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || pausing || stopping}><Radio size={12} />{pausing ? "Saving part…" : "Start next part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || pausing || stopping}><CircleStop size={12} />End match</Button></>}
       </div>
     </Panel>
+
+    {cameraProblem ? <div role="alert" className="flex shrink-0 flex-col gap-3 rounded-xl border border-amber-300/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-50 sm:flex-row sm:items-center">
+      <AlertTriangle size={18} className="shrink-0 text-amber-300" />
+      <span className="min-w-0 flex-1">{cameraProblem}</span>
+      <Button
+        size="sm"
+        variant="primary"
+        className="shrink-0"
+        disabled={pausing || stopping}
+        onClick={() => paused && activeLive ? void resumeRecording() : void connectCamera()}
+      ><Camera size={14} />{pausing ? "Saving current part…" : paused && activeLive ? "Reconnect & continue" : "Reconnect camera"}</Button>
+    </div> : null}
 
     {notice ? <div role="status" aria-live="polite" className="fixed bottom-4 right-4 z-50 flex max-w-sm items-start gap-3 rounded-xl border border-cyan-300/25 bg-pitch-950/95 px-4 py-3 text-sm text-cyan-50 shadow-2xl backdrop-blur-xl"><span className="min-w-0 flex-1">{notice}</span><button type="button" aria-label="Dismiss message" onClick={() => setNotice(null)} className="shrink-0 text-cyan-200/70 transition hover:text-white"><X size={15} /></button></div> : null}
 

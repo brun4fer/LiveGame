@@ -442,6 +442,14 @@ Recommended practice:
 - Reconnect the capture card and select **Connect camera** again.
 - Confirm that the production page uses HTTPS.
 
+### The camera signal is lost during recording
+
+Live Game detects when the browser camera track ends or remains muted. It immediately stops adding data to the damaged part and attempts to preserve that MP4. After securing the HDMI, capture-card and USB connections, select **Reconnect & continue**. Recording resumes in a new part on the same match timeline and existing tagged moments remain available.
+
+If the capture card continues sending black frames instead of reporting a disconnection, select the camera button manually. Live Game will preserve the current part before allowing the camera to be reconnected.
+
+Test an unstable camera in the Windows Camera application. If the signal also fails there, check the physical cable, capture card, USB port, camera power-saving settings and HDMI output before the match.
+
 ### Start live does not begin
 
 - Connect the camera first.
