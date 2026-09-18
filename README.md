@@ -153,9 +153,10 @@ Only the camera computer starts and ends the recording.
 1. Open the match and select the camera button, labelled **Connect camera**.
 2. Allow browser access to the camera and microphone.
 3. If more than one camera is available, select the correct device.
-4. Confirm that the live image is visible.
+4. Confirm that the live image is visible. If a phone or capture source arrives vertically, use the rotation button to move through 0°, 90°, 180° and 270° until it is horizontal.
+5. Check the orientation before selecting **Start live**. Rotation is locked while a recording part is active and is applied to the preview, complete MP4, replay and exported clips.
 
-If using a capture card, select it as the camera source. Test audio and video before kick-off.
+If using a capture card, select it as the camera source. Test audio and video before kick-off. Live Game remembers the chosen rotation for each camera on that computer.
 
 ### Start recording
 

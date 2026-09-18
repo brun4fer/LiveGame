@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, AlertTriangle, ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Loader2, Pause, Pencil, Play, Radio, RotateCcw, Settings2, Trash2, Users, Video, X } from "lucide-react";
+import { Activity, AlertTriangle, ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Loader2, Pause, Pencil, Play, Radio, RotateCcw, RotateCw, Settings2, Trash2, Users, Video, X } from "lucide-react";
 
 import { MatchEditDialog } from "@/components/match-edit-dialog";
 import { MomentEditDialog } from "@/components/moment-edit-dialog";
@@ -20,6 +20,7 @@ import { formatTime, roundTime } from "@/lib/time";
 import { downloadBlob, exportSegmentedMomentClip, planSegmentedMomentExport, type TimedVideoSource } from "@/lib/video-export";
 
 const CAPTURE_MODE_KEY = "live-game-capture-mode";
+const CAMERA_ROTATIONS_KEY = "live-game-camera-rotations";
 
 const captureProfiles = {
   standard: {
@@ -44,6 +45,7 @@ const captureProfiles = {
 
 type PreparedSegment = { id: string; uploadUrl: string; sequence: number };
 type CaptureMode = keyof typeof captureProfiles;
+type CameraRotation = 0 | 90 | 180 | 270;
 type CaptureDiagnostics = {
   width: number | null;
   height: number | null;
@@ -59,6 +61,11 @@ type PeriodMarkerKey = "firstHalfStartSeconds" | "firstHalfEndSeconds" | "second
 type LocalWritableFile = { write(data: Blob): Promise<void>; close(): Promise<void>; abort?(): Promise<void> };
 type LocalFileHandle = LocalVideoFileHandle & { createWritable(): Promise<LocalWritableFile> };
 type LocalDirectoryHandle = { getFileHandle(name: string, options: { create: true }): Promise<LocalFileHandle> };
+type RotatedCameraResources = {
+  video: HTMLVideoElement;
+  stream: MediaStream;
+  cancelFrame: () => void;
+};
 type LocalReplaySegment = {
   sequence: number;
   startedAtSeconds: number;
@@ -129,12 +136,124 @@ function mergeLiveSession(current: LiveSessionRecord | null, next: LiveSessionRe
   return { ...next, segments: [...merged.values()].sort((a, b) => a.sequence - b.sequence) };
 }
 
+function storedCameraRotation(deviceId: string): CameraRotation | null {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(CAMERA_ROTATIONS_KEY) || "{}") as Record<string, number>;
+    const rotation = saved[deviceId || "default"];
+    return rotation === 0 || rotation === 90 || rotation === 180 || rotation === 270 ? rotation : null;
+  } catch {
+    return null;
+  }
+}
+
+function savedCameraRotation(deviceId: string): CameraRotation {
+  return storedCameraRotation(deviceId) ?? 0;
+}
+
+function rememberCameraRotation(deviceId: string, rotation: CameraRotation) {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(CAMERA_ROTATIONS_KEY) || "{}") as Record<string, number>;
+    saved[deviceId || "default"] = rotation;
+    window.localStorage.setItem(CAMERA_ROTATIONS_KEY, JSON.stringify(saved));
+  } catch {
+    // A blocked localStorage must not prevent camera capture.
+  }
+}
+
+async function createRotatedCameraStream(source: MediaStream, rotation: Exclude<CameraRotation, 0>, frameRate: number): Promise<RotatedCameraResources> {
+  const sourceTrack = source.getVideoTracks()[0];
+  if (!sourceTrack) throw new Error("The selected camera does not provide a video track.");
+
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.autoplay = true;
+  video.srcObject = source;
+  if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        cleanup();
+        reject(new Error("Timed out while preparing camera rotation."));
+      }, 10_000);
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        video.removeEventListener("loadedmetadata", loaded);
+        video.removeEventListener("error", failed);
+      };
+      const loaded = () => { cleanup(); resolve(); };
+      const failed = () => { cleanup(); reject(new Error("The camera image could not be prepared for rotation.")); };
+      video.addEventListener("loadedmetadata", loaded, { once: true });
+      video.addEventListener("error", failed, { once: true });
+    });
+  }
+  await video.play();
+
+  const settings = sourceTrack.getSettings();
+  const sourceWidth = video.videoWidth || settings.width || 1280;
+  const sourceHeight = video.videoHeight || settings.height || 720;
+  const swapsDimensions = rotation === 90 || rotation === 270;
+  const canvas = document.createElement("canvas");
+  canvas.width = swapsDimensions ? sourceHeight : sourceWidth;
+  canvas.height = swapsDimensions ? sourceWidth : sourceHeight;
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) throw new Error("The browser could not prepare the rotated camera image.");
+
+  const drawFrame = () => {
+    context.save();
+    context.fillStyle = "#000";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.translate(canvas.width / 2, canvas.height / 2);
+    context.rotate(rotation * Math.PI / 180);
+    context.drawImage(video, -sourceWidth / 2, -sourceHeight / 2, sourceWidth, sourceHeight);
+    context.restore();
+  };
+  drawFrame();
+
+  let cancelled = false;
+  let frameRequest = 0;
+  let videoFrameRequest = 0;
+  if (typeof video.requestVideoFrameCallback === "function") {
+    const drawVideoFrame = () => {
+      if (cancelled) return;
+      drawFrame();
+      videoFrameRequest = video.requestVideoFrameCallback(drawVideoFrame);
+    };
+    videoFrameRequest = video.requestVideoFrameCallback(drawVideoFrame);
+  } else {
+    const drawAnimationFrame = () => {
+      if (cancelled) return;
+      drawFrame();
+      frameRequest = window.requestAnimationFrame(drawAnimationFrame);
+    };
+    frameRequest = window.requestAnimationFrame(drawAnimationFrame);
+  }
+
+  const canvasStream = canvas.captureStream(frameRate);
+  const stream = new MediaStream([...canvasStream.getVideoTracks(), ...source.getAudioTracks()]);
+  const rotatedTrack = stream.getVideoTracks()[0];
+  if (rotatedTrack) rotatedTrack.contentHint = "motion";
+
+  return {
+    video,
+    stream,
+    cancelFrame: () => {
+      cancelled = true;
+      if (frameRequest) window.cancelAnimationFrame(frameRequest);
+      if (videoFrameRequest && typeof video.cancelVideoFrameCallback === "function") video.cancelVideoFrameCallback(videoFrameRequest);
+      video.pause();
+      video.srcObject = null;
+    },
+  };
+}
+
 export function LiveWorkspace({ matchId }: { matchId: string }) {
   const router = useRouter();
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const replayVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteLiveVideoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const captureStreamRef = useRef<MediaStream | null>(null);
+  const rotatedCameraResourcesRef = useRef<RotatedCameraResources | null>(null);
   const publisherSessionRef = useRef<BrowserWebRtcSession | null>(null);
   const viewerSessionRef = useRef<BrowserWebRtcSession | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -170,6 +289,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [session, setSession] = useState<LiveSessionRecord | null>(null);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState("");
+  const [cameraRotation, setCameraRotation] = useState<CameraRotation>(0);
   const [captureMode, setCaptureMode] = useState<CaptureMode>("standard");
   const [captureDiagnostics, setCaptureDiagnostics] = useState<CaptureDiagnostics>({
     width: null,
@@ -207,6 +327,36 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [liveViewers, setLiveViewers] = useState<LiveViewer[]>([]);
   const [clock, setClock] = useState(() => Date.now());
+
+  function disposeRotatedCameraOutput() {
+    const resources = rotatedCameraResourcesRef.current;
+    if (!resources) return;
+    resources.cancelFrame();
+    resources.stream.getVideoTracks().forEach((track) => track.stop());
+    rotatedCameraResourcesRef.current = null;
+  }
+
+  async function applyCameraRotation(source: MediaStream, rotation: CameraRotation) {
+    disposeRotatedCameraOutput();
+    if (rotation === 0) {
+      captureStreamRef.current = source;
+    } else {
+      const resources = await createRotatedCameraStream(source, rotation, captureProfiles[captureMode].frameRate);
+      rotatedCameraResourcesRef.current = resources;
+      captureStreamRef.current = resources.stream;
+    }
+    if (cameraVideoRef.current) cameraVideoRef.current.srcObject = captureStreamRef.current;
+  }
+
+  function stopCameraStreams() {
+    cameraStreamGenerationRef.current += 1;
+    disposeRotatedCameraOutput();
+    const source = streamRef.current;
+    captureStreamRef.current = null;
+    streamRef.current = null;
+    source?.getTracks().forEach((track) => track.stop());
+    if (cameraVideoRef.current) cameraVideoRef.current.srcObject = null;
+  }
 
   const applySession = useCallback((next: LiveSessionRecord | null) => {
     setSession((current) => mergeLiveSession(current, next));
@@ -255,6 +405,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   useEffect(() => {
     const savedMode = window.localStorage.getItem(CAPTURE_MODE_KEY);
     if (savedMode === "standard" || savedMode === "compatibility") setCaptureMode(savedMode);
+    setCameraRotation(savedCameraRotation(""));
   }, []);
 
   useEffect(() => {
@@ -282,7 +433,10 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     closeWebRtcSession(viewerSessionRef.current);
     publisherSessionRef.current = null;
     viewerSessionRef.current = null;
+    disposeRotatedCameraOutput();
+    captureStreamRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
     for (const url of localSegmentUrlsRef.current.values()) URL.revokeObjectURL(url);
     localSegmentUrlsRef.current.clear();
     localReplaySegmentsRef.current.clear();
@@ -301,7 +455,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   }, [paused, recording, stopping]);
 
   useEffect(() => {
-    if (cameraVideoRef.current && streamRef.current) cameraVideoRef.current.srcObject = streamRef.current;
+    if (cameraVideoRef.current && captureStreamRef.current) cameraVideoRef.current.srcObject = captureStreamRef.current;
   }, [cameraConnected, atLiveEdge]);
 
   useEffect(() => {
@@ -602,8 +756,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     setCameraProblem(wasRecording ? `${message} Saving the current recording part…` : message);
 
     if (!wasRecording) {
-      failedStream.getTracks().forEach((track) => track.stop());
-      if (streamRef.current === failedStream) streamRef.current = null;
+      if (streamRef.current === failedStream) stopCameraStreams();
+      else failedStream.getTracks().forEach((track) => track.stop());
       cameraLossHandlingRef.current = false;
       return;
     }
@@ -627,8 +781,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       closeWebRtcSession(publisherSessionRef.current);
       publisherSessionRef.current = null;
       const completedPart = await stopLocalArchive(segmentTimelineCursorRef.current);
-      failedStream.getTracks().forEach((track) => track.stop());
-      if (streamRef.current === failedStream) streamRef.current = null;
+      if (streamRef.current === failedStream) stopCameraStreams();
+      else failedStream.getTracks().forEach((track) => track.stop());
       setPaused(true);
       setAtLiveEdge(false);
       if (completedPart) {
@@ -639,8 +793,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         setCameraProblem(`${message} Secure the connection, then reconnect and continue. Previously completed parts remain available.`);
       }
     } catch (error) {
-      failedStream.getTracks().forEach((track) => track.stop());
-      if (streamRef.current === failedStream) streamRef.current = null;
+      if (streamRef.current === failedStream) stopCameraStreams();
+      else failedStream.getTracks().forEach((track) => track.stop());
       setPaused(true);
       setCameraProblem(`${message} ${error instanceof Error ? error.message : "The current part could not be finalized cleanly."} Previously completed parts remain available.`);
     } finally {
@@ -659,16 +813,51 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     if (cameraConnected) setNotice(`${captureProfiles[nextMode].label} selected. Use the camera button to reconnect and apply it.`);
   }
 
+  function changeCameraDevice(nextDeviceId: string) {
+    setDeviceId(nextDeviceId);
+    setCameraRotation(savedCameraRotation(nextDeviceId));
+    if (cameraConnected) setNotice("Camera selected. Use the camera button to reconnect and apply it.");
+  }
+
+  async function rotateCamera() {
+    if (recording || pausing || stopping) return;
+    const nextRotation = ((cameraRotation + 90) % 360) as CameraRotation;
+    setCameraRotation(nextRotation);
+    rememberCameraRotation(deviceId, nextRotation);
+
+    const source = streamRef.current;
+    if (!source || !cameraConnected) {
+      setNotice(`Camera rotation set to ${nextRotation}°. It will be applied when the camera connects.`);
+      return;
+    }
+
+    try {
+      await applyCameraRotation(source, nextRotation);
+      const settings = source.getVideoTracks()[0]?.getSettings();
+      const swapsDimensions = nextRotation === 90 || nextRotation === 270;
+      setCaptureDiagnostics((current) => ({
+        ...current,
+        width: swapsDimensions ? settings?.height ?? null : settings?.width ?? null,
+        height: swapsDimensions ? settings?.width ?? null : settings?.height ?? null,
+        lastEvent: `Camera rotated to ${nextRotation}°`,
+      }));
+      setNotice(`Camera rotated to ${nextRotation}°. Preview and saved recordings now use this orientation.`);
+    } catch (error) {
+      await applyCameraRotation(source, 0).catch(() => undefined);
+      setCameraRotation(0);
+      rememberCameraRotation(deviceId, 0);
+      setNotice(error instanceof Error ? error.message : "The camera image could not be rotated.");
+    }
+  }
+
   async function connectCamera() {
     if (!navigator.mediaDevices?.getUserMedia) {
       setNotice("Camera capture is not supported in this browser.");
       return false;
     }
-    cameraStreamGenerationRef.current += 1;
     if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
     cameraMuteTimerRef.current = null;
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
+    stopCameraStreams();
     setCameraConnected(false);
     try {
       const profile = captureProfiles[captureMode];
@@ -697,33 +886,44 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       streamRef.current = stream;
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) videoTrack.contentHint = "motion";
+      const trackSettings = videoTrack?.getSettings();
+      const activeDevice = trackSettings?.deviceId;
+      const rotationToApply = !deviceId && activeDevice
+        ? storedCameraRotation(activeDevice) ?? cameraRotation
+        : cameraRotation;
+      setCameraRotation(rotationToApply);
+      await applyCameraRotation(stream, rotationToApply);
       monitorCameraStream(stream);
-      if (cameraVideoRef.current) cameraVideoRef.current.srcObject = stream;
       setCameraConnected(true);
       setCameraProblem(null);
       setAtLiveEdge(true);
       setReplayTarget(null);
       const available = await navigator.mediaDevices.enumerateDevices();
       setDevices(available.filter((device) => device.kind === "videoinput"));
-      const trackSettings = videoTrack?.getSettings();
-      const activeDevice = trackSettings?.deviceId;
-      if (activeDevice) setDeviceId(activeDevice);
+      if (activeDevice) {
+        setDeviceId(activeDevice);
+        rememberCameraRotation(activeDevice, rotationToApply);
+      }
       const reconnecting = successfulCameraConnectionsRef.current > 0;
       successfulCameraConnectionsRef.current += 1;
       setCaptureDiagnostics((current) => ({
         ...current,
-        width: trackSettings?.width ?? null,
-        height: trackSettings?.height ?? null,
+        width: rotationToApply === 90 || rotationToApply === 270 ? trackSettings?.height ?? null : trackSettings?.width ?? null,
+        height: rotationToApply === 90 || rotationToApply === 270 ? trackSettings?.width ?? null : trackSettings?.height ?? null,
         frameRate: trackSettings?.frameRate ?? null,
         archiveMimeType: null,
         replayMimeType: null,
         reconnections: current.reconnections + (reconnecting ? 1 : 0),
         lastEvent: reconnecting ? "Camera reconnected" : "Camera connected",
       }));
-      const actualResolution = trackSettings?.width && trackSettings?.height ? ` at ${trackSettings.width}×${trackSettings.height}` : "";
-      setNotice(`${profile.label} camera connected${actualResolution}. Start the live session when the match feed is ready.`);
+      const outputWidth = rotationToApply === 90 || rotationToApply === 270 ? trackSettings?.height : trackSettings?.width;
+      const outputHeight = rotationToApply === 90 || rotationToApply === 270 ? trackSettings?.width : trackSettings?.height;
+      const actualResolution = outputWidth && outputHeight ? ` at ${outputWidth}×${outputHeight}` : "";
+      const rotationLabel = rotationToApply ? `, rotated ${rotationToApply}°` : "";
+      setNotice(`${profile.label} camera connected${actualResolution}${rotationLabel}. Start the live session when the match feed is ready.`);
       return true;
     } catch (error) {
+      stopCameraStreams();
       const message = error instanceof Error ? error.message : "The camera could not be opened.";
       setCaptureDiagnostics((current) => ({ ...current, lastEvent: `Connection failed: ${message}` }));
       setNotice(message);
@@ -750,7 +950,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   }
 
   async function startLocalArchive(directory: LocalDirectoryHandle, partNumber: number, startTimeSeconds: number) {
-    if (!streamRef.current || !match) throw new Error("Connect the camera before creating the local recording.");
+    if (!captureStreamRef.current || !match) throw new Error("Connect the camera before creating the local recording.");
     const fileName = localRecordingFileName(match.title, partNumber);
     const fileHandle = await directory.getFileHandle(fileName, { create: true });
     const writer = await fileHandle.createWritable();
@@ -761,7 +961,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     }
     let archiveRecorder: MediaRecorder;
     try {
-      archiveRecorder = new MediaRecorder(streamRef.current, {
+      archiveRecorder = new MediaRecorder(captureStreamRef.current, {
         mimeType,
         videoBitsPerSecond: captureProfiles[captureMode].archiveVideoBitsPerSecond,
         audioBitsPerSecond: 128_000,
@@ -862,9 +1062,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     closeWebRtcSession(publisherSessionRef.current);
     publisherSessionRef.current = null;
     if (!activeSession.publishUrl) return null;
-    if (!streamRef.current) return "The camera stream is not available for realtime sharing.";
+    if (!captureStreamRef.current) return "The camera stream is not available for realtime sharing.";
     try {
-      const published = await publishCameraStream(streamRef.current, activeSession.publishUrl);
+      const published = await publishCameraStream(captureStreamRef.current, activeSession.publishUrl);
       publisherSessionRef.current = published;
       published.peer.onconnectionstatechange = () => {
         if (!["failed", "disconnected"].includes(published.peer.connectionState) || publisherSessionRef.current !== published) return;
@@ -932,7 +1132,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   }
 
   async function recordNextSegment(activeSession: LiveSessionRecord) {
-    if (!recordingRef.current || !streamRef.current) return;
+    if (!recordingRef.current || !captureStreamRef.current) return;
     const sequence = sequenceRef.current++;
     const startedAtSeconds = segmentTimelineCursorRef.current;
     segmentStartedAtClockRef.current = Date.now();
@@ -947,7 +1147,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         }).then((prepared) => ({ prepared, error: null })).catch((error: unknown) => ({ prepared: null, error }))
       : Promise.resolve({ prepared: null, error: null });
     const chunks: BlobPart[] = [];
-    const recorder = new MediaRecorder(streamRef.current, {
+    const recorder = new MediaRecorder(captureStreamRef.current, {
       mimeType,
       videoBitsPerSecond: captureProfile.replayVideoBitsPerSecond,
       audioBitsPerSecond: 96_000,
@@ -1058,8 +1258,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       publisherSessionRef.current = null;
       const completedPart = await stopLocalArchive(segmentTimelineCursorRef.current);
       if (!completedPart) throw new Error("The recording part could not be finalized.");
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
+      stopCameraStreams();
       setCameraConnected(false);
       setPaused(true);
       setAtLiveEdge(false);
@@ -1122,8 +1321,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     closeWebRtcSession(publisherSessionRef.current);
     publisherSessionRef.current = null;
     const finalizationResults = await Promise.allSettled([stopLocalArchive(segmentTimelineCursorRef.current), ...pendingUploadsRef.current]);
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
+    stopCameraStreams();
     setCameraConnected(false);
     try {
       const ended = await apiFetch<LiveSessionRecord>(`/api/matches/${matchId}/live`, { method: "PATCH" });
@@ -1362,6 +1560,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const showingRemoteLive = Boolean(activeLive && atLiveEdge && !cameraConnected && remoteLiveStream);
   const captureDiagnosticSummary = [
     captureProfiles[captureMode].label,
+    `Rotation ${cameraRotation}°`,
     captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : "resolution pending",
     captureDiagnostics.frameRate ? `${Math.round(captureDiagnostics.frameRate)} fps` : "fps pending",
     `MP4 ${codecLabel(captureDiagnostics.archiveMimeType)}`,
@@ -1381,11 +1580,12 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; const taggingUnavailable = !activeLive || paused || (!recording && !remoteLiveStream); return <button key={type.id} type="button" disabled={taggingUnavailable || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 min-w-[6rem] shrink-0 items-center justify-between gap-2 rounded-md border px-2 text-left transition ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0"><span className="block truncate text-[9px] font-bold" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 block text-[8px] text-slate-600">{busy ? "Saving…" : taggingUnavailable ? "Recording stopped" : "Previous 20s"}</span></span><kbd className="rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300">{type.defaultShortcut || "—"}</kbd></button>; })}
       </div>
       <div className="ml-auto flex min-w-0 shrink-0 items-center justify-end gap-1 border-l border-white/10 px-1.5 max-md:w-full max-md:border-b max-md:border-l-0">
-        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-36 sm:flex-none" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} disabled={recording || pausing || stopping}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
+        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-36 sm:flex-none" value={deviceId} onChange={(event) => changeCameraDevice(event.target.value)} disabled={recording || pausing || stopping}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
         <Select aria-label="Capture mode" title="Capture mode" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-32 sm:flex-none" value={captureMode} onChange={(event) => changeCaptureMode(event.target.value as CaptureMode)} disabled={recording || pausing || stopping}>
           <option value="standard">Standard</option>
           <option value="compatibility">Compatibility 720p</option>
         </Select>
+        <Button size="sm" className="h-8 shrink-0 px-2 text-[10px]" title={`Rotate camera 90° clockwise · current rotation ${cameraRotation}°`} aria-label={`Rotate camera 90 degrees clockwise; current rotation ${cameraRotation} degrees`} onClick={() => void rotateCamera()} disabled={recording || pausing || stopping}><RotateCw size={12} />{cameraRotation}°</Button>
         {cameraConnected || captureDiagnostics.reconnections > 0 ? <Badge className="hidden max-w-40 truncate border-cyan-300/20 bg-cyan-300/[.07] text-[9px] text-cyan-100 xl:inline-flex" title={captureDiagnosticSummary}><Activity size={11} />{captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : captureProfiles[captureMode].label} · {captureDiagnostics.reconnections}R</Badge> : null}
         {(recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : paused && localParts.length ? <Badge className="hidden border-amber-300/25 bg-amber-300/10 text-[9px] text-amber-100 2xl:inline-flex">{localParts.length} part{localParts.length === 1 ? "" : "s"} saved</Badge> : null}
         <Button
