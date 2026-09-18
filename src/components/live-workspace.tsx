@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Loader2, Pause, Pencil, Play, Radio, RotateCcw, Settings2, Trash2, Users, Video, X } from "lucide-react";
+import { Activity, AlertTriangle, ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Loader2, Pause, Pencil, Play, Radio, RotateCcw, Settings2, Trash2, Users, Video, X } from "lucide-react";
 
 import { MatchEditDialog } from "@/components/match-edit-dialog";
 import { MomentEditDialog } from "@/components/moment-edit-dialog";
@@ -19,9 +19,40 @@ import { SmartVideoExportSession } from "@/lib/smart-video-export";
 import { formatTime, roundTime } from "@/lib/time";
 import { downloadBlob } from "@/lib/video-export";
 
-const SEGMENT_MILLISECONDS = 5_000;
+const CAPTURE_MODE_KEY = "live-game-capture-mode";
+
+const captureProfiles = {
+  standard: {
+    label: "Standard",
+    width: 1920,
+    height: 1080,
+    frameRate: 30,
+    archiveVideoBitsPerSecond: 8_000_000,
+    replayVideoBitsPerSecond: 4_000_000,
+    segmentMilliseconds: 10_000,
+  },
+  compatibility: {
+    label: "Compatibility 720p",
+    width: 1280,
+    height: 720,
+    frameRate: 25,
+    archiveVideoBitsPerSecond: 5_000_000,
+    replayVideoBitsPerSecond: 2_500_000,
+    segmentMilliseconds: 10_000,
+  },
+} as const;
 
 type PreparedSegment = { id: string; uploadUrl: string; sequence: number };
+type CaptureMode = keyof typeof captureProfiles;
+type CaptureDiagnostics = {
+  width: number | null;
+  height: number | null;
+  frameRate: number | null;
+  archiveMimeType: string | null;
+  replayMimeType: string | null;
+  reconnections: number;
+  lastEvent: string;
+};
 type LiveViewer = { user: { id: string; name: string; username: string }; atLiveEdge: boolean; playbackPositionSeconds: number | null };
 type ReplayTarget = { segmentId: string; offsetSeconds: number; autoplay: boolean; command: number };
 type PeriodMarkerKey = "firstHalfStartSeconds" | "firstHalfEndSeconds" | "secondHalfStartSeconds" | "secondHalfEndSeconds";
@@ -53,8 +84,18 @@ function presenceClientId() {
 }
 
 function supportedSegmentMimeType() {
-  const options = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"];
+  const options = ["video/webm;codecs=vp8,opus", "video/webm;codecs=vp9,opus", "video/webm"];
   return options.find((type) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(type)) || "video/webm";
+}
+
+function codecLabel(mimeType: string | null) {
+  if (!mimeType) return "pending";
+  if (mimeType.includes("vp8")) return "VP8";
+  if (mimeType.includes("vp9")) return "VP9";
+  if (mimeType.includes("avc1") || mimeType.includes("h264")) return "H.264";
+  if (mimeType.includes("mp4")) return "MP4";
+  if (mimeType.includes("webm")) return "WebM";
+  return mimeType;
 }
 
 function supportedArchiveMimeType() {
@@ -113,6 +154,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const cameraStreamGenerationRef = useRef(0);
   const cameraMuteTimerRef = useRef<number | null>(null);
   const cameraLossHandlingRef = useRef(false);
+  const successfulCameraConnectionsRef = useRef(0);
 
   const [match, setMatch] = useState<MatchDetail | null>(null);
   const [settings, setSettings] = useState<SettingsPayload | null>(null);
@@ -120,6 +162,16 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [session, setSession] = useState<LiveSessionRecord | null>(null);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState("");
+  const [captureMode, setCaptureMode] = useState<CaptureMode>("standard");
+  const [captureDiagnostics, setCaptureDiagnostics] = useState<CaptureDiagnostics>({
+    width: null,
+    height: null,
+    frameRate: null,
+    archiveMimeType: null,
+    replayMimeType: null,
+    reconnections: 0,
+    lastEvent: "Waiting for camera",
+  });
   const [cameraConnected, setCameraConnected] = useState(false);
   const [cameraProblem, setCameraProblem] = useState<string | null>(null);
   const [remoteLiveStream, setRemoteLiveStream] = useState<MediaStream | null>(null);
@@ -190,6 +242,11 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 500);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const savedMode = window.localStorage.getItem(CAPTURE_MODE_KEY);
+    if (savedMode === "standard" || savedMode === "compatibility") setCaptureMode(savedMode);
   }, []);
 
   useEffect(() => {
@@ -526,6 +583,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   async function handleCameraLoss(message: string) {
     if (cameraLossHandlingRef.current || !streamRef.current) return;
     cameraLossHandlingRef.current = true;
+    setCaptureDiagnostics((current) => ({ ...current, lastEvent: message }));
     const failedStream = streamRef.current;
     const wasRecording = recordingRef.current;
     cameraStreamGenerationRef.current += 1;
@@ -582,6 +640,16 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     }
   }
 
+  function changeCaptureMode(nextMode: CaptureMode) {
+    setCaptureMode(nextMode);
+    window.localStorage.setItem(CAPTURE_MODE_KEY, nextMode);
+    setCaptureDiagnostics((current) => ({
+      ...current,
+      lastEvent: `${captureProfiles[nextMode].label} selected${cameraConnected ? "; reconnect the camera to apply it" : ""}`,
+    }));
+    if (cameraConnected) setNotice(`${captureProfiles[nextMode].label} selected. Use the camera button to reconnect and apply it.`);
+  }
+
   async function connectCamera() {
     if (!navigator.mediaDevices?.getUserMedia) {
       setNotice("Camera capture is not supported in this browser.");
@@ -594,7 +662,18 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     streamRef.current = null;
     setCameraConnected(false);
     try {
-      const defaultVideo = { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
+      const profile = captureProfiles[captureMode];
+      const defaultVideo = captureMode === "compatibility"
+        ? {
+            width: { ideal: profile.width, max: profile.width },
+            height: { ideal: profile.height, max: profile.height },
+            frameRate: { ideal: profile.frameRate, max: 30 },
+          }
+        : {
+            width: { ideal: profile.width },
+            height: { ideal: profile.height },
+            frameRate: { ideal: profile.frameRate },
+          };
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -607,6 +686,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         stream = await navigator.mediaDevices.getUserMedia({ video: defaultVideo, audio: true });
       }
       streamRef.current = stream;
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) videoTrack.contentHint = "motion";
       monitorCameraStream(stream);
       if (cameraVideoRef.current) cameraVideoRef.current.srcObject = stream;
       setCameraConnected(true);
@@ -615,12 +696,27 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       setReplayTarget(null);
       const available = await navigator.mediaDevices.enumerateDevices();
       setDevices(available.filter((device) => device.kind === "videoinput"));
-      const activeDevice = stream.getVideoTracks()[0]?.getSettings().deviceId;
+      const trackSettings = videoTrack?.getSettings();
+      const activeDevice = trackSettings?.deviceId;
       if (activeDevice) setDeviceId(activeDevice);
-      setNotice("Camera connected. Start the live session when the match feed is ready.");
+      const reconnecting = successfulCameraConnectionsRef.current > 0;
+      successfulCameraConnectionsRef.current += 1;
+      setCaptureDiagnostics((current) => ({
+        ...current,
+        width: trackSettings?.width ?? null,
+        height: trackSettings?.height ?? null,
+        frameRate: trackSettings?.frameRate ?? null,
+        archiveMimeType: null,
+        replayMimeType: null,
+        reconnections: current.reconnections + (reconnecting ? 1 : 0),
+        lastEvent: reconnecting ? "Camera reconnected" : "Camera connected",
+      }));
+      const actualResolution = trackSettings?.width && trackSettings?.height ? ` at ${trackSettings.width}×${trackSettings.height}` : "";
+      setNotice(`${profile.label} camera connected${actualResolution}. Start the live session when the match feed is ready.`);
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : "The camera could not be opened.";
+      setCaptureDiagnostics((current) => ({ ...current, lastEvent: `Connection failed: ${message}` }));
       setNotice(message);
       setCameraProblem(`The camera could not be reconnected. ${message} Check the cable and try again.`);
       return false;
@@ -656,7 +752,11 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     }
     let archiveRecorder: MediaRecorder;
     try {
-      archiveRecorder = new MediaRecorder(streamRef.current, { mimeType, videoBitsPerSecond: 8_000_000, audioBitsPerSecond: 128_000 });
+      archiveRecorder = new MediaRecorder(streamRef.current, {
+        mimeType,
+        videoBitsPerSecond: captureProfiles[captureMode].archiveVideoBitsPerSecond,
+        audioBitsPerSecond: 128_000,
+      });
     } catch (error) {
       await writer.abort?.().catch(() => undefined);
       throw error;
@@ -671,6 +771,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     archiveWriteChainRef.current = Promise.resolve();
     archiveFileNameRef.current = fileName;
     setLocalArchiveName(fileName);
+    setCaptureDiagnostics((current) => ({ ...current, archiveMimeType: mimeType, lastEvent: `Recording part ${partNumber}` }));
     let resolveFinalization!: () => void;
     let rejectFinalization!: (reason?: unknown) => void;
     archiveFinalizedRef.current = new Promise<void>((resolve, reject) => {
@@ -681,6 +782,12 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       if (!event.data.size) return;
       archiveWriteChainRef.current = archiveWriteChainRef.current.then(() => writer.write(event.data));
       void archiveWriteChainRef.current.catch(() => undefined);
+    };
+    archiveRecorder.onerror = (event) => {
+      const recorderError = (event as Event & { error?: DOMException }).error;
+      const message = recorderError?.message || "The main MP4 recorder reported an error.";
+      setCaptureDiagnostics((current) => ({ ...current, lastEvent: `MP4 recorder error: ${message}` }));
+      void handleCameraLoss(message);
     };
     archiveRecorder.onstop = async () => {
       try {
@@ -821,6 +928,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     const startedAtSeconds = segmentTimelineCursorRef.current;
     segmentStartedAtClockRef.current = Date.now();
     const mimeType = supportedSegmentMimeType();
+    const captureProfile = captureProfiles[captureMode];
+    setCaptureDiagnostics((current) => ({ ...current, replayMimeType: mimeType }));
     const cloudReplayEnabled = process.env.NEXT_PUBLIC_LIVE_CLOUD_REPLAY_ENABLED === "true" && shouldUploadReplayFromOrigin(window.location);
     const preparation = cloudReplayEnabled
       ? apiFetch<PreparedSegment>(`/api/live-sessions/${activeSession.id}/segments`, {
@@ -829,10 +938,20 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         }).then((prepared) => ({ prepared, error: null })).catch((error: unknown) => ({ prepared: null, error }))
       : Promise.resolve({ prepared: null, error: null });
     const chunks: BlobPart[] = [];
-    const recorder = new MediaRecorder(streamRef.current, { mimeType, videoBitsPerSecond: 8_000_000, audioBitsPerSecond: 128_000 });
+    const recorder = new MediaRecorder(streamRef.current, {
+      mimeType,
+      videoBitsPerSecond: captureProfile.replayVideoBitsPerSecond,
+      audioBitsPerSecond: 96_000,
+    });
     recorderRef.current = recorder;
     const startedAt = performance.now();
     recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+    recorder.onerror = (event) => {
+      const recorderError = (event as Event & { error?: DOMException }).error;
+      const message = recorderError?.message || "The replay recorder reported an error.";
+      setCaptureDiagnostics((current) => ({ ...current, lastEvent: `Replay recorder error: ${message}` }));
+      void handleCameraLoss(message);
+    };
     recorder.onstop = () => {
       const durationSeconds = Math.max(0.1, (performance.now() - startedAt) / 1000);
       segmentTimelineCursorRef.current = Math.max(segmentTimelineCursorRef.current, startedAtSeconds + durationSeconds);
@@ -888,7 +1007,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       void upload.finally(() => pendingUploadsRef.current.delete(upload));
     };
     recorder.start();
-    recorderTimerRef.current = window.setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, SEGMENT_MILLISECONDS);
+    recorderTimerRef.current = window.setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, captureProfile.segmentMilliseconds);
   }
 
   async function uploadSegment(liveSessionId: string, prepared: PreparedSegment, blob: Blob, durationSeconds: number) {
@@ -1168,6 +1287,15 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const canReplay = readySegments.length > 0;
   const behindLive = activeLive ? Math.max(0, liveEdgeSeconds - currentTime) : 0;
   const showingRemoteLive = Boolean(activeLive && atLiveEdge && !cameraConnected && remoteLiveStream);
+  const captureDiagnosticSummary = [
+    captureProfiles[captureMode].label,
+    captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : "resolution pending",
+    captureDiagnostics.frameRate ? `${Math.round(captureDiagnostics.frameRate)} fps` : "fps pending",
+    `MP4 ${codecLabel(captureDiagnostics.archiveMimeType)}`,
+    `Replay ${codecLabel(captureDiagnostics.replayMimeType)}`,
+    `${captureDiagnostics.reconnections} reconnect${captureDiagnostics.reconnections === 1 ? "" : "s"}`,
+    captureDiagnostics.lastEvent,
+  ].join(" · ");
 
   return <div className="flex min-h-0 flex-col gap-2 xl:h-[calc(100dvh-6.5rem)] xl:overflow-hidden">
     <Panel className="flex shrink-0 flex-wrap items-stretch overflow-hidden md:flex-nowrap">
@@ -1180,7 +1308,12 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; const taggingUnavailable = !activeLive || paused || (!recording && !remoteLiveStream); return <button key={type.id} type="button" disabled={taggingUnavailable || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 min-w-[6rem] shrink-0 items-center justify-between gap-2 rounded-md border px-2 text-left transition ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0"><span className="block truncate text-[9px] font-bold" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 block text-[8px] text-slate-600">{busy ? "Saving…" : taggingUnavailable ? "Recording stopped" : "Previous 20s"}</span></span><kbd className="rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300">{type.defaultShortcut || "—"}</kbd></button>; })}
       </div>
       <div className="ml-auto flex min-w-0 shrink-0 items-center justify-end gap-1 border-l border-white/10 px-1.5 max-md:w-full max-md:border-b max-md:border-l-0">
-        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-36 sm:flex-none" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} disabled={recording}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
+        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-36 sm:flex-none" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} disabled={recording || pausing || stopping}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
+        <Select aria-label="Capture mode" title="Capture mode" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-32 sm:flex-none" value={captureMode} onChange={(event) => changeCaptureMode(event.target.value as CaptureMode)} disabled={recording || pausing || stopping}>
+          <option value="standard">Standard</option>
+          <option value="compatibility">Compatibility 720p</option>
+        </Select>
+        {cameraConnected || captureDiagnostics.reconnections > 0 ? <Badge className="hidden max-w-40 truncate border-cyan-300/20 bg-cyan-300/[.07] text-[9px] text-cyan-100 xl:inline-flex" title={captureDiagnosticSummary}><Activity size={11} />{captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : captureProfiles[captureMode].label} · {captureDiagnostics.reconnections}R</Badge> : null}
         {(recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : paused && localParts.length ? <Badge className="hidden border-amber-300/25 bg-amber-300/10 text-[9px] text-amber-100 2xl:inline-flex">{localParts.length} part{localParts.length === 1 ? "" : "s"} saved</Badge> : null}
         <Button
           size="icon"
@@ -1199,7 +1332,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
     {cameraProblem ? <div role="alert" className="flex shrink-0 flex-col gap-3 rounded-xl border border-amber-300/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-50 sm:flex-row sm:items-center">
       <AlertTriangle size={18} className="shrink-0 text-amber-300" />
-      <span className="min-w-0 flex-1">{cameraProblem}</span>
+      <span className="min-w-0 flex-1"><span className="block">{cameraProblem}</span><span className="mt-1 block text-[10px] text-amber-100/60">{captureDiagnosticSummary}</span></span>
       <Button
         size="sm"
         variant="primary"
@@ -1218,6 +1351,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
           {showingRemoteLive && remotePlaybackNeedsAction ? <button type="button" onClick={() => void remoteLiveVideoRef.current?.play()} className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm font-semibold text-white"><span className="rounded-lg border border-cyan-300/35 bg-pitch-950/90 px-4 py-3"><Play size={16} className="mr-2 inline" />Start live video</span></button> : null}
           {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${paused ? "bg-amber-600" : "bg-red-600"}`}>{paused ? "INTERVAL · PART SAVED" : "● RECORDING"}</span> : null}
           {activeLive ? <span className={`absolute right-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold ${atLiveEdge ? "bg-cyan-300 text-slate-950" : "bg-slate-900/85 text-cyan-100"}`}>{atLiveEdge ? "LIVE" : `REPLAY · ${formatTime(behindLive)} behind`}</span> : null}
+          {atLiveEdge && cameraConnected ? <span className="absolute bottom-3 left-3 max-w-[calc(100%-1.5rem)] truncate rounded-md border border-white/10 bg-slate-950/75 px-2 py-1 font-mono text-[9px] text-slate-300 backdrop-blur-sm" title={captureDiagnosticSummary}><Activity size={10} className="mr-1 inline text-cyan-300" />{captureProfiles[captureMode].label} · {captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : "detecting"} · {captureDiagnostics.frameRate ? `${Math.round(captureDiagnostics.frameRate)}fps` : "fps—"} · {captureDiagnostics.reconnections}R</span> : null}
         </div>
         <div className="shrink-0 border-t border-white/10 bg-pitch-950/90 p-2">
           <input aria-label="Live recording position" type="range" min={0} max={Math.max(availableEdgeSeconds, 0.1)} step={0.1} value={Math.min(currentTime, availableEdgeSeconds)} disabled={!canReplay} onChange={(event) => { setPreviewEnd(null); void seekVirtual(Number(event.target.value), atLiveEdge || playing); }} className="h-1.5 w-full cursor-pointer accent-cyan-300 disabled:cursor-not-allowed disabled:opacity-40" style={{ background: availableEdgeSeconds ? `linear-gradient(to right, #67e8f9 ${(Math.min(currentTime, availableEdgeSeconds) / availableEdgeSeconds) * 100}%, rgba(255,255,255,.14) ${(Math.min(currentTime, availableEdgeSeconds) / availableEdgeSeconds) * 100}%)` : undefined }} />

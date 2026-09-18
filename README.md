@@ -442,13 +442,19 @@ Recommended practice:
 - Reconnect the capture card and select **Connect camera** again.
 - Confirm that the production page uses HTTPS.
 
+An iPhone may appear directly on a Mac through Apple Continuity Camera. An Android phone only appears through a direct USB cable when that phone implements USB webcam mode. On a supported phone, open the USB connection notification and select **Webcam**. If this option does not exist, use a compatible HDMI output adapter and the USB capture card, or a supported virtual-camera application. When using the capture card, Live Game lists the capture device rather than the Android phone name.
+
 ### The camera signal is lost during recording
 
 Live Game detects when the browser camera track ends or remains muted. It immediately stops adding data to the damaged part and attempts to preserve that MP4. After securing the HDMI, capture-card and USB connections, select **Reconnect & continue**. Recording resumes in a new part on the same match timeline and existing tagged moments remain available.
 
 If the capture card continues sending black frames instead of reporting a disconnection, select the camera button manually. Live Game will preserve the current part before allowing the camera to be reconnected.
 
-Test an unstable camera in the Windows Camera application. If the signal also fails there, check the physical cable, capture card, USB port, camera power-saving settings and HDMI output before the match.
+Test an unstable camera in QuickTime Player on macOS or the Camera application on Windows. If the signal also fails there, check the physical cable, capture card, USB port, camera power-saving settings and HDMI output before the match.
+
+Use **Standard** capture for normal Full HD operation. Standard keeps the complete MP4 at high quality while using a lighter VP8 replay stream with ten-second segments. Select **Compatibility 720p** before connecting an unstable phone, HDMI adapter or capture card. This reduces resolution and encoder load for greater stability. The selected mode is remembered on that computer.
+
+The diagnostic label over the live image shows the active mode, actual resolution, frame rate and reconnection count. Hover over the label or the camera status badge to see the recording and replay codecs and the latest capture event.
 
 ### Start live does not begin
 
