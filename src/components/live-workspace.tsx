@@ -17,7 +17,7 @@ import { getMatchPeriodAtTime } from "@/lib/match-periods";
 import { shouldUploadReplayFromOrigin } from "@/lib/replay-upload-origin";
 import { SmartVideoExportSession } from "@/lib/smart-video-export";
 import { formatTime, roundTime } from "@/lib/time";
-import { downloadBlob } from "@/lib/video-export";
+import { downloadBlob, exportSegmentedMomentClip, planSegmentedMomentExport, type TimedVideoSource } from "@/lib/video-export";
 
 const CAPTURE_MODE_KEY = "live-game-capture-mode";
 
@@ -59,6 +59,13 @@ type PeriodMarkerKey = "firstHalfStartSeconds" | "firstHalfEndSeconds" | "second
 type LocalWritableFile = { write(data: Blob): Promise<void>; close(): Promise<void>; abort?(): Promise<void> };
 type LocalFileHandle = LocalVideoFileHandle & { createWritable(): Promise<LocalWritableFile> };
 type LocalDirectoryHandle = { getFileHandle(name: string, options: { create: true }): Promise<LocalFileHandle> };
+type LocalReplaySegment = {
+  sequence: number;
+  startedAtSeconds: number;
+  durationSeconds: number;
+  mimeType: string;
+  blob: Blob;
+};
 
 const periodMarkers: Array<[PeriodMarkerKey, string]> = [
   ["firstHalfStartSeconds", "Start 1st half"],
@@ -143,6 +150,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const archivePartNumberRef = useRef(1);
   const archivePartStartedAtRef = useRef(0);
   const localSegmentUrlsRef = useRef(new Map<number, string>());
+  const localReplaySegmentsRef = useRef(new Map<number, LocalReplaySegment>());
   const localPartUrlsRef = useRef(new Map<string, string>());
   const sequenceRef = useRef(0);
   const segmentTimelineCursorRef = useRef(0);
@@ -277,6 +285,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     for (const url of localSegmentUrlsRef.current.values()) URL.revokeObjectURL(url);
     localSegmentUrlsRef.current.clear();
+    localReplaySegmentsRef.current.clear();
     for (const url of localPartUrlsRef.current.values()) URL.revokeObjectURL(url);
     localPartUrlsRef.current.clear();
   }, []);
@@ -957,6 +966,15 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       segmentTimelineCursorRef.current = Math.max(segmentTimelineCursorRef.current, startedAtSeconds + durationSeconds);
       segmentStartedAtClockRef.current = 0;
       const blob = new Blob(chunks, { type: mimeType });
+      if (blob.size) {
+        localReplaySegmentsRef.current.set(sequence, {
+          sequence,
+          startedAtSeconds,
+          durationSeconds,
+          mimeType,
+          blob,
+        });
+      }
       // Begin the next independent recording immediately. Preparing and uploading
       // this completed segment must never introduce a gap in the camera capture.
       if (recordingRef.current) void recordNextSegment(activeSession);
@@ -1173,39 +1191,94 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     if (!seekVirtual(moment.startTimeSeconds, true)) setNotice("This part of the recording is not available yet.");
   }
 
-  async function exportMoment(moment: MomentRecord) {
-    if (!match || exportingMomentId) return;
-    const part = localParts.find((item) => moment.startTimeSeconds >= item.startTimeSeconds - 0.05 && moment.endTimeSeconds <= item.startTimeSeconds + item.durationSeconds + 0.05);
-    if (!part) {
-      setNotice("Finish the current recording part before exporting this moment.");
-      return;
+  function localReplaySegmentsForMoment(moment: MomentRecord) {
+    const segments = [...localReplaySegmentsRef.current.values()].sort((a, b) => a.startedAtSeconds - b.startedAtSeconds);
+    const sources: TimedVideoSource[] = segments.map((segment) => ({
+      sourceUrl: String(segment.sequence),
+      startedAtSeconds: segment.startedAtSeconds,
+      durationSeconds: segment.durationSeconds,
+    }));
+    const plan = planSegmentedMomentExport(sources, moment.startTimeSeconds, moment.endTimeSeconds);
+    if (!plan.complete) return null;
+    const usedSequences = new Set(plan.slices.map((slice) => Number(slice.sourceUrl)));
+    return segments.filter((segment) => usedSequences.has(segment.sequence));
+  }
+
+  async function waitForLocalReplaySegments(moment: MomentRecord) {
+    let available = localReplaySegmentsForMoment(moment);
+    if (available) return available;
+
+    setNotice("Finishing the replay buffer for this clip. The main recording is continuing...");
+    if (recordingRef.current && recorderRef.current?.state === "recording") {
+      if (recorderTimerRef.current !== null) {
+        window.clearTimeout(recorderTimerRef.current);
+        recorderTimerRef.current = null;
+      }
+      recorderRef.current.stop();
     }
 
-    const localMoment = {
-      ...moment,
-      startTimeSeconds: Math.max(0, moment.startTimeSeconds - part.startTimeSeconds),
-      endTimeSeconds: Math.max(0.1, moment.endTimeSeconds - part.startTimeSeconds),
-    };
-    const fallbackUrl = localPartUrlsRef.current.get(part.id) || URL.createObjectURL(part.file);
-    const ownsFallbackUrl = !localPartUrlsRef.current.has(part.id);
-    const exporter = new SmartVideoExportSession(part.file);
+    const deadline = Date.now() + 12_000;
+    while (Date.now() < deadline) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
+      available = localReplaySegmentsForMoment(moment);
+      if (available) return available;
+    }
+
+    throw new Error("The complete moment is not available in this computer's replay buffer yet.");
+  }
+
+  async function exportMoment(moment: MomentRecord) {
+    if (!match || exportingMomentId) return;
     setExportingMomentId(moment.id);
-    setNotice(`Preparing ${moment.momentType.name} for export…`);
+    const part = localParts.find((item) => moment.startTimeSeconds >= item.startTimeSeconds - 0.05 && moment.endTimeSeconds <= item.startTimeSeconds + item.durationSeconds + 0.05);
     try {
-      const result = await exporter.exportMoment({
-        match,
-        moment: localMoment,
-        quality: "high",
-        sourceUrlFallback: fallbackUrl,
-        onStatus: (message) => setNotice(message),
-      });
-      downloadBlob(result.blob, result.fileName);
-      setNotice(`${moment.momentType.name} exported successfully.`);
+      if (part) {
+        const localMoment = {
+          ...moment,
+          startTimeSeconds: Math.max(0, moment.startTimeSeconds - part.startTimeSeconds),
+          endTimeSeconds: Math.max(0.1, moment.endTimeSeconds - part.startTimeSeconds),
+        };
+        const fallbackUrl = localPartUrlsRef.current.get(part.id) || URL.createObjectURL(part.file);
+        const ownsFallbackUrl = !localPartUrlsRef.current.has(part.id);
+        const exporter = new SmartVideoExportSession(part.file);
+        setNotice(`Preparing ${moment.momentType.name} for export...`);
+        try {
+          const result = await exporter.exportMoment({
+            match,
+            moment: localMoment,
+            quality: "high",
+            sourceUrlFallback: fallbackUrl,
+            onStatus: (message) => setNotice(message),
+          });
+          downloadBlob(result.blob, result.fileName);
+        } finally {
+          exporter.dispose();
+          if (ownsFallbackUrl) URL.revokeObjectURL(fallbackUrl);
+        }
+      } else {
+        const replaySegments = await waitForLocalReplaySegments(moment);
+        const temporaryUrls = replaySegments.map((segment) => ({ url: URL.createObjectURL(segment.blob), segment }));
+        try {
+          const result = await exportSegmentedMomentClip({
+            sources: temporaryUrls.map(({ url, segment }) => ({
+              sourceUrl: url,
+              startedAtSeconds: segment.startedAtSeconds,
+              durationSeconds: segment.durationSeconds,
+            })),
+            match,
+            moment,
+            quality: "standard",
+            onStatus: (message) => setNotice(message),
+          });
+          downloadBlob(result.blob, result.fileName);
+        } finally {
+          temporaryUrls.forEach(({ url }) => URL.revokeObjectURL(url));
+        }
+      }
+      setNotice(`${moment.momentType.name} exported successfully. The live recording continued throughout.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "This moment could not be exported.");
     } finally {
-      exporter.dispose();
-      if (ownsFallbackUrl) URL.revokeObjectURL(fallbackUrl);
       setExportingMomentId(null);
     }
   }
@@ -1375,7 +1448,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
       <Panel className="order-1 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
         <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Tagged moments</p><p className="mt-1 text-xs text-slate-400">{match.moments.length} in the recording</p></div><Badge title={liveViewers.map((viewer) => `${viewer.user.name} · ${viewer.atLiveEdge ? "live" : "replay"}`).join("\n")}><Users size={11} className="mr-1" />{liveViewers.length || (account ? 1 : 0)}</Badge></div><p className="mt-2 text-[10px] leading-4 text-slate-500">Select a row to review it without stopping the recording.</p></div>
-        <div className="min-h-0 flex-1 overflow-y-auto">{match.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Tagged moments will appear here.</p> : match.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}${moment.createdBy ? ` · ${moment.createdBy.name}` : ""}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button><button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button><button type="button" className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-violet-300/25 bg-violet-300/10 text-violet-100 hover:bg-violet-300/20 disabled:cursor-wait disabled:opacity-40" onClick={() => void exportMoment(moment)} disabled={Boolean(exportingMomentId)} aria-label={`Export ${moment.momentType.name}`} title="Export this moment as MP4">{exportingMomentId === moment.id ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] text-cyan-100" onClick={() => setEditingMoment(moment)}><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removeMoment(moment)}><Trash2 size={11} />Delete</button>{moment.notes ? <p className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] leading-4 text-amber-200">{moment.notes}</p> : null}</div>)}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto">{match.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Tagged moments will appear here.</p> : match.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}${moment.createdBy ? ` · ${moment.createdBy.name}` : ""}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button><button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button><button type="button" className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-violet-300/25 bg-violet-300/10 text-violet-100 hover:bg-violet-300/20 disabled:cursor-wait disabled:opacity-40" onClick={() => void exportMoment(moment)} disabled={Boolean(exportingMomentId)} aria-label={`Download ${moment.momentType.name}`} title="Download this moment as MP4 without stopping the recording">{exportingMomentId === moment.id ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] text-cyan-100" onClick={() => setEditingMoment(moment)}><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removeMoment(moment)}><Trash2 size={11} />Delete</button>{moment.notes ? <p className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] leading-4 text-amber-200">{moment.notes}</p> : null}</div>)}</div>
       </Panel>
     </div>
 

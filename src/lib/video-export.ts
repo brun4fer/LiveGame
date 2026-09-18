@@ -15,6 +15,17 @@ type ExportMomentClipResult = {
   mimeType: string;
 };
 
+export type TimedVideoSource = {
+  sourceUrl: string;
+  startedAtSeconds: number;
+  durationSeconds: number;
+};
+
+export type TimedVideoSlice = TimedVideoSource & {
+  startSeconds: number;
+  endSeconds: number;
+};
+
 type AudioExportResources = {
   audioContext: AudioContext;
 };
@@ -32,6 +43,185 @@ const qualitySettings: Record<ExportQuality, { maxWidth: number | null; frameRat
   high: { maxWidth: 1920, frameRate: 50, videoBitsPerSecond: 18_000_000, audioBitsPerSecond: 192_000 },
   standard: { maxWidth: 1920, frameRate: 30, videoBitsPerSecond: 9_000_000, audioBitsPerSecond: 160_000 },
 };
+
+const SEGMENT_COVERAGE_TOLERANCE_SECONDS = 0.35;
+
+export function planSegmentedMomentExport(
+  sources: TimedVideoSource[],
+  startTimeSeconds: number,
+  endTimeSeconds: number,
+) {
+  const start = Math.max(0, startTimeSeconds);
+  const end = Math.max(start + 0.1, endTimeSeconds);
+  const ordered = [...sources].sort((a, b) => a.startedAtSeconds - b.startedAtSeconds);
+  const slices: TimedVideoSlice[] = [];
+  let coveredUntil = start;
+
+  for (const source of ordered) {
+    const sourceStart = source.startedAtSeconds;
+    const sourceEnd = sourceStart + source.durationSeconds;
+    if (sourceEnd <= coveredUntil + 0.01 || sourceStart >= end) continue;
+    if (sourceStart > coveredUntil + SEGMENT_COVERAGE_TOLERANCE_SECONDS) break;
+
+    const sliceStart = Math.max(start, coveredUntil, sourceStart);
+    const sliceEnd = Math.min(end, sourceEnd);
+    if (sliceEnd <= sliceStart + 0.01) continue;
+
+    slices.push({
+      ...source,
+      startSeconds: Math.max(0, sliceStart - sourceStart),
+      endSeconds: Math.max(0.1, sliceEnd - sourceStart),
+    });
+    coveredUntil = Math.max(coveredUntil, sliceEnd);
+    if (coveredUntil >= end - SEGMENT_COVERAGE_TOLERANCE_SECONDS) break;
+  }
+
+  return {
+    slices,
+    complete: slices.length > 0 && coveredUntil >= end - SEGMENT_COVERAGE_TOLERANCE_SECONDS,
+    coveredUntil,
+  };
+}
+
+export async function exportSegmentedMomentClip({
+  sources,
+  match,
+  moment,
+  onStatus,
+  quality = "standard",
+}: Omit<ExportMomentClipInput, "sourceUrl"> & { sources: TimedVideoSource[] }): Promise<ExportMomentClipResult> {
+  if (typeof MediaRecorder === "undefined") {
+    throw new Error("This browser does not support video export.");
+  }
+
+  const mimeType = getSupportedVideoMimeType();
+  if (!mimeType) {
+    throw new Error("This browser does not support MP4/H.264 export. Use a recent version of Chrome or Edge.");
+  }
+
+  const plan = planSegmentedMomentExport(sources, moment.startTimeSeconds, moment.endTimeSeconds);
+  if (!plan.complete) {
+    throw new Error("The replay buffer does not contain the complete moment yet.");
+  }
+
+  onStatus?.("Preparing the live replay segments...");
+  const sourceVideo = document.createElement("video");
+  sourceVideo.preload = "auto";
+  sourceVideo.playsInline = true;
+  sourceVideo.crossOrigin = "anonymous";
+
+  let animationFrame = 0;
+  let outputStream: MediaStream | null = null;
+  let audioResources: AudioExportResources | null = null;
+  let recorder: MediaRecorder | null = null;
+  let recordingResult: Promise<Blob> | null = null;
+  let recorderStarted = false;
+
+  try {
+    await loadVideoSource(sourceVideo, plan.slices[0].sourceUrl);
+    const exportSettings = qualitySettings[quality];
+    const dimensions = getExportDimensions(sourceVideo.videoWidth, sourceVideo.videoHeight, exportSettings.maxWidth);
+    const canvas = document.createElement("canvas");
+    canvas.width = dimensions.width;
+    canvas.height = dimensions.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Could not prepare the live clip for export.");
+
+    outputStream = canvas.captureStream(exportSettings.frameRate);
+    audioResources = await addAudioToStream(sourceVideo, outputStream);
+    if (!audioResources) sourceVideo.muted = true;
+
+    const chunks: Blob[] = [];
+    recorder = new MediaRecorder(outputStream, {
+      mimeType,
+      videoBitsPerSecond: exportSettings.videoBitsPerSecond,
+      audioBitsPerSecond: exportSettings.audioBitsPerSecond,
+    });
+    recordingResult = new Promise<Blob>((resolve, reject) => {
+      recorder!.ondataavailable = (event) => { if (event.data.size > 0) chunks.push(event.data); };
+      recorder!.onerror = () => reject(new Error("Could not record the live clip."));
+      recorder!.onstop = () => {
+        const blob = new Blob(chunks, { type: recorder?.mimeType || mimeType });
+        if (!blob.size) reject(new Error("The live clip export finished without video data."));
+        else resolve(blob);
+      };
+    });
+
+    const requestedDuration = Math.max(0.1, moment.endTimeSeconds - moment.startTimeSeconds);
+    let completedDuration = 0;
+
+    for (let index = 0; index < plan.slices.length; index += 1) {
+      const slice = plan.slices[index];
+      if (index > 0) await loadVideoSource(sourceVideo, slice.sourceUrl);
+
+      const finiteDuration = Number.isFinite(sourceVideo.duration) ? sourceVideo.duration : slice.endSeconds;
+      const sliceStart = Math.max(0, Math.min(slice.startSeconds, finiteDuration));
+      const sliceEnd = Math.max(sliceStart + 0.05, Math.min(slice.endSeconds, finiteDuration));
+      await seekVideo(sourceVideo, sliceStart);
+      context.drawImage(sourceVideo, 0, 0, canvas.width, canvas.height);
+
+      if (recorder.state === "inactive") {
+        recorder.start(250);
+        recorderStarted = true;
+      } else if (recorder.state === "paused") {
+        await changeRecorderState(recorder, "resume", () => recorder!.resume());
+      }
+
+      const sliceDuration = sliceEnd - sliceStart;
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          sourceVideo.pause();
+          resolve();
+        };
+        const draw = () => {
+          if (settled) return;
+          context.drawImage(sourceVideo, 0, 0, canvas.width, canvas.height);
+          const elapsed = Math.max(0, Math.min(sourceVideo.currentTime - sliceStart, sliceDuration));
+          onStatus?.(`Exporting live clip: ${formatTime(Math.min(requestedDuration, completedDuration + elapsed))} / ${formatTime(requestedDuration)}...`);
+          if (sourceVideo.ended || sourceVideo.currentTime >= sliceEnd - 0.025) {
+            finish();
+            return;
+          }
+          animationFrame = requestAnimationFrame(draw);
+        };
+
+        sourceVideo.play().then(() => {
+          draw();
+        }).catch((error: unknown) => {
+          settled = true;
+          reject(error instanceof Error ? error : new Error("Could not play a replay segment during export."));
+        });
+      });
+      completedDuration += sliceDuration;
+
+      if (index < plan.slices.length - 1 && recorder.state === "recording") {
+        await changeRecorderState(recorder, "pause", () => recorder!.pause());
+      }
+    }
+
+    if (recorder.state !== "inactive") recorder.stop();
+    const blob = await recordingResult;
+    return {
+      blob,
+      fileName: buildClipFileName(match, moment, "mp4"),
+      mimeType: blob.type || mimeType,
+    };
+  } catch (error) {
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+    if (recorderStarted) await recordingResult?.catch(() => undefined);
+    throw error;
+  } finally {
+    if (animationFrame) cancelAnimationFrame(animationFrame);
+    sourceVideo.pause();
+    sourceVideo.removeAttribute("src");
+    sourceVideo.load();
+    outputStream?.getTracks().forEach((track) => track.stop());
+    await audioResources?.audioContext.close();
+  }
+}
 
 export async function exportMomentClip({
   sourceUrl,
@@ -444,6 +634,19 @@ function waitForMediaEvent(element: HTMLMediaElement, eventName: keyof HTMLMedia
   });
 }
 
+async function loadVideoSource(video: HTMLVideoElement, sourceUrl: string) {
+  video.pause();
+  video.src = sourceUrl;
+  video.load();
+  await waitForMediaEvent(video, "loadedmetadata");
+}
+
+async function changeRecorderState(recorder: MediaRecorder, eventName: "pause" | "resume", change: () => void) {
+  const changed = new Promise<void>((resolve) => recorder.addEventListener(eventName, () => resolve(), { once: true }));
+  change();
+  await Promise.race([changed, wait(1_000)]);
+}
+
 async function seekVideo(video: HTMLVideoElement, seconds: number) {
   video.currentTime = seconds;
   await Promise.race([waitForMediaEvent(video, "seeked"), wait(250)]);
@@ -475,4 +678,3 @@ function extensionForMimeType(mimeType: string) {
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
-
