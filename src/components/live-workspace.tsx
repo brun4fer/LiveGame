@@ -320,6 +320,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [seekTime, setSeekTime] = useState("");
   const [previewEnd, setPreviewEnd] = useState<number | null>(null);
   const [selectedMomentId, setSelectedMomentId] = useState<string | null>(null);
+  const [pendingMomentReviewId, setPendingMomentReviewId] = useState<string | null>(null);
   const [busyMomentTypeId, setBusyMomentTypeId] = useState<string | null>(null);
   const [editingMoment, setEditingMoment] = useState<MomentRecord | null>(null);
   const [exportingMomentId, setExportingMomentId] = useState<string | null>(null);
@@ -640,7 +641,21 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     return true;
   }, [openSegment, readySegments]);
 
+  useEffect(() => {
+    if (!pendingMomentReviewId || !match) return;
+    const moment = match.moments.find((item) => item.id === pendingMomentReviewId);
+    if (!moment) return setPendingMomentReviewId(null);
+    const sources: TimedVideoSource[] = readySegments
+      .filter((segment) => segment.playbackUrl && segment.durationSeconds)
+      .map((segment) => ({ sourceUrl: segment.playbackUrl!, startedAtSeconds: segment.startedAtSeconds, durationSeconds: segment.durationSeconds! }));
+    if (!planSegmentedMomentExport(sources, moment.startTimeSeconds, moment.endTimeSeconds).complete) return;
+    setPendingMomentReviewId(null);
+    setPreviewEnd(moment.endTimeSeconds);
+    if (seekVirtual(moment.startTimeSeconds, true)) setNotice(`${moment.momentType.name} is ready for replay.`);
+  }, [match, pendingMomentReviewId, readySegments, seekVirtual]);
+
   const goLive = useCallback(() => {
+    setPendingMomentReviewId(null);
     setPreviewEnd(null);
     setAtLiveEdge(true);
     if (cameraConnected || session?.playbackUrl) {
@@ -1393,7 +1408,16 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   function reviewMoment(moment: MomentRecord) {
     setSelectedMomentId(moment.id);
     setPreviewEnd(moment.endTimeSeconds);
-    if (!seekVirtual(moment.startTimeSeconds, true)) setNotice("This part of the recording is not available yet.");
+    const sources: TimedVideoSource[] = readySegments
+      .filter((segment) => segment.playbackUrl && segment.durationSeconds)
+      .map((segment) => ({ sourceUrl: segment.playbackUrl!, startedAtSeconds: segment.startedAtSeconds, durationSeconds: segment.durationSeconds! }));
+    const complete = planSegmentedMomentExport(sources, moment.startTimeSeconds, moment.endTimeSeconds).complete;
+    setPendingMomentReviewId(complete ? null : moment.id);
+    if (!seekVirtual(moment.startTimeSeconds, true)) {
+      setNotice("Finalizing this clip on the phone. It will open automatically when ready.");
+    } else if (!complete) {
+      setNotice("The available part is playing while the final seconds finish uploading. The complete clip will restart automatically.");
+    }
   }
 
   function localReplaySegmentsForMoment(moment: MomentRecord) {
@@ -1432,6 +1456,30 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     throw new Error("The complete moment is not available in this computer's replay buffer yet.");
   }
 
+  function cloudReplaySegmentsForMoment(moment: MomentRecord, segments = readySegments) {
+    const sources: TimedVideoSource[] = segments.flatMap((segment) => segment.playbackUrl && segment.durationSeconds
+      ? [{ sourceUrl: segment.playbackUrl, startedAtSeconds: segment.startedAtSeconds, durationSeconds: segment.durationSeconds }]
+      : []);
+    return planSegmentedMomentExport(sources, moment.startTimeSeconds, moment.endTimeSeconds).complete ? sources : null;
+  }
+
+  async function waitForCloudReplaySegments(moment: MomentRecord) {
+    let available = cloudReplaySegmentsForMoment(moment);
+    if (available) return available;
+    if (!session) throw new Error("This live session is no longer available.");
+    setNotice("Finalizing the clip on the phone and loading it from the shared replay…");
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 800));
+      const latest = await apiFetch<LiveSessionRecord>(`/api/live-sessions/${session.id}`);
+      applySession(latest);
+      const cloudSegments = latest.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl);
+      available = cloudReplaySegmentsForMoment(moment, cloudSegments);
+      if (available) return available;
+    }
+    throw new Error("The phone did not finish uploading the complete clip. Check the replay upload warning on the phone and the R2 CORS domain.");
+  }
+
   async function exportMoment(moment: MomentRecord) {
     if (!match || exportingMomentId) return;
     setExportingMomentId(moment.id);
@@ -1461,23 +1509,36 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
           if (ownsFallbackUrl) URL.revokeObjectURL(fallbackUrl);
         }
       } else {
-        const replaySegments = await waitForLocalReplaySegments(moment);
-        const temporaryUrls = replaySegments.map((segment) => ({ url: URL.createObjectURL(segment.blob), segment }));
-        try {
+        const useLocalReplay = recordingRef.current || localReplaySegmentsRef.current.size > 0;
+        if (useLocalReplay) {
+          const replaySegments = await waitForLocalReplaySegments(moment);
+          const temporaryUrls = replaySegments.map((segment) => ({ url: URL.createObjectURL(segment.blob), segment }));
+          try {
+            const result = await exportSegmentedMomentClip({
+              sources: temporaryUrls.map(({ url, segment }) => ({
+                sourceUrl: url,
+                startedAtSeconds: segment.startedAtSeconds,
+                durationSeconds: segment.durationSeconds,
+              })),
+              match,
+              moment,
+              quality: "standard",
+              onStatus: (message) => setNotice(message),
+            });
+            downloadBlob(result.blob, result.fileName);
+          } finally {
+            temporaryUrls.forEach(({ url }) => URL.revokeObjectURL(url));
+          }
+        } else {
+          const cloudSources = await waitForCloudReplaySegments(moment);
           const result = await exportSegmentedMomentClip({
-            sources: temporaryUrls.map(({ url, segment }) => ({
-              sourceUrl: url,
-              startedAtSeconds: segment.startedAtSeconds,
-              durationSeconds: segment.durationSeconds,
-            })),
+            sources: cloudSources,
             match,
             moment,
             quality: "standard",
             onStatus: (message) => setNotice(message),
           });
           downloadBlob(result.blob, result.fileName);
-        } finally {
-          temporaryUrls.forEach(({ url }) => URL.revokeObjectURL(url));
         }
       }
       setNotice(`${moment.momentType.name} exported successfully. The live recording continued throughout.`);

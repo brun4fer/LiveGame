@@ -77,12 +77,14 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const wakeLockRef = useRef<WakeLockHandle | null>(null);
+  const pendingUploadTasksRef = useRef(new Set<Promise<void>>());
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState("");
   const [rotation, setRotation] = useState<CameraRotation>(0);
   const [cameraReady, setCameraReady] = useState(false);
   const [broadcasting, setBroadcasting] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [connection, setConnection] = useState<"idle" | "connecting" | "live" | "reconnecting">("idle");
   const [pendingUploads, setPendingUploads] = useState(0);
   const [warning, setWarning] = useState<string | null>(null);
@@ -193,7 +195,9 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
       timelineRef.current = startedAtSeconds + durationSeconds;
       const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || "video/webm" });
       if (broadcastingRef.current && generation === segmentGenerationRef.current) recordSegment(sessionId, generation);
-      void uploadSegment(sessionId, sequence, startedAtSeconds, blob, durationSeconds);
+      const uploadTask = uploadSegment(sessionId, sequence, startedAtSeconds, blob, durationSeconds);
+      pendingUploadTasksRef.current.add(uploadTask);
+      void uploadTask.finally(() => pendingUploadTasksRef.current.delete(uploadTask));
     };
     recorder.start();
     segmentTimerRef.current = window.setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, SEGMENT_MS);
@@ -255,16 +259,30 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
   }
 
   async function stopBroadcast() {
-    broadcastingRef.current = false;
-    segmentGenerationRef.current += 1;
-    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
-    if (segmentTimerRef.current !== null) window.clearTimeout(segmentTimerRef.current);
-    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
-    closeWebRtcSession(webRtcRef.current);
-    webRtcRef.current = null;
-    setBroadcasting(false);
-    setConnection("idle");
-    await releaseWakeLock();
+    if (stopping) return;
+    setStopping(true);
+    try {
+      broadcastingRef.current = false;
+      segmentGenerationRef.current += 1;
+      if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+      if (segmentTimerRef.current !== null) window.clearTimeout(segmentTimerRef.current);
+      const recorder = recorderRef.current;
+      const recorderStopped = recorder?.state === "recording"
+        ? new Promise<void>((resolve) => {
+            recorder.addEventListener("stop", () => resolve(), { once: true });
+            recorder.stop();
+          })
+        : Promise.resolve();
+      closeWebRtcSession(webRtcRef.current);
+      webRtcRef.current = null;
+      setBroadcasting(false);
+      setConnection("idle");
+      await recorderStopped;
+      await Promise.allSettled([...pendingUploadTasksRef.current]);
+      await releaseWakeLock();
+    } finally {
+      setStopping(false);
+    }
   }
 
   async function changeDevice(nextDeviceId: string) {
@@ -328,9 +346,9 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
     {error ? <div role="alert" className="flex items-start gap-2 rounded-lg border border-red-400/30 bg-red-500/10 p-3 text-sm text-red-100"><AlertTriangle size={17} className="mt-0.5 shrink-0" /><span>{error}</span></div> : null}
     {warning ? <div role="status" className="flex items-start gap-2 rounded-lg border border-amber-300/30 bg-amber-400/10 p-3 text-sm text-amber-50"><AlertTriangle size={17} className="mt-0.5 shrink-0" /><span>{warning}</span></div> : null}
     <Panel className="flex flex-col gap-2 p-3 sm:flex-row sm:items-center">
-      <Select aria-label="Phone camera" value={deviceId} onChange={(event) => void changeDevice(event.target.value)} disabled={starting} className="sm:flex-1">{devices.length ? devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>) : <option value="">Rear camera</option>}</Select>
-      <Button onClick={() => void rotate()} disabled={!cameraReady || starting}><RotateCw size={15} />Rotate {rotation}°</Button>
-      {!broadcasting ? <Button variant="primary" onClick={() => void startBroadcast()} disabled={starting}>{starting ? <Loader2 size={15} className="animate-spin" /> : <Radio size={15} />}{starting ? "Starting…" : "Start broadcast"}</Button> : <Button variant="danger" onClick={() => void stopBroadcast()}><CircleStop size={15} />Stop for interval</Button>}
+      <Select aria-label="Phone camera" value={deviceId} onChange={(event) => void changeDevice(event.target.value)} disabled={starting || stopping} className="sm:flex-1">{devices.length ? devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>) : <option value="">Rear camera</option>}</Select>
+      <Button onClick={() => void rotate()} disabled={!cameraReady || starting || stopping}><RotateCw size={15} />Rotate {rotation}°</Button>
+      {!broadcasting ? <Button variant="primary" onClick={() => void startBroadcast()} disabled={starting || stopping}>{starting || stopping ? <Loader2 size={15} className="animate-spin" /> : <Radio size={15} />}{stopping ? "Finalizing clips…" : starting ? "Starting…" : "Start broadcast"}</Button> : <Button variant="danger" onClick={() => void stopBroadcast()} disabled={stopping}>{stopping ? <Loader2 size={15} className="animate-spin" /> : <CircleStop size={15} />}{stopping ? "Finalizing clips…" : "Stop for interval"}</Button>}
     </Panel>
     <p className="px-1 text-center text-xs leading-5 text-slate-500">Keep this page open. Stopping for the interval preserves the recorded parts; press Start broadcast again for the second half. {pendingUploads ? `${pendingUploads} replay segment${pendingUploads === 1 ? "" : "s"} uploading.` : "Replay segments are up to date."}</p>
   </main>;
