@@ -171,6 +171,22 @@ When Cloudflare Stream is explicitly enabled and configured, **Start live** also
 
 The first replay segment normally becomes available after approximately five seconds. Recording continues when a user rewinds, pauses, reviews a clip or returns to live.
 
+### Use an Android or iPhone as a wireless camera
+
+This method uses Wi-Fi or mobile data, not Bluetooth. Both devices must have a stable internet connection, and the production application must be opened through HTTPS.
+
+1. Open the match on a computer and select the **phone** button beside **Connect camera**.
+2. Scan the displayed QR code with the phone. A pairing link remains valid for eight hours and does not sign the phone into the staff account.
+3. Turn the phone horizontally and open the link in Chrome on Android or Safari on iPhone.
+4. Select **Connect camera** and allow camera and microphone access.
+5. Select the rear camera from the list. Use **Rotate** if the preview is not horizontal.
+6. Select **Start broadcast** and keep that page open with the screen unlocked.
+7. Open the same match on any staff computer. The live image appears automatically; each staff member can independently rewind or return to live.
+
+At half-time, select **Stop for interval** on the phone. The uploaded replay and tagged moments remain available on the computers. Select **Start broadcast** on the same phone page for the second half; it continues the same match timeline.
+
+If Wi-Fi drops briefly, the phone attempts to reconnect automatically. A warning about replay upload does not stop the live WebRTC image. A warning about the camera signal requires checking the phone camera permission or reopening the capture device.
+
 ### Pause at half-time
 
 1. Select **End part** when the referee ends the first half.
@@ -530,12 +546,14 @@ Cloudflare Stream is disabled by default while multi-device transmission is not 
 1. Enable Cloudflare Stream on the same Cloudflare account.
 2. Create an Account API Token with **Stream Write** permission.
 3. Set `CLOUDFLARE_STREAM_ENABLED=true` only when realtime sharing is required.
-4. Set `NEXT_PUBLIC_LIVE_CLOUD_REPLAY_ENABLED=true` only when rewindable replay must also be uploaded to R2. Leave it `false` for the same-computer workflow.
+4. Set `NEXT_PUBLIC_LIVE_CLOUD_REPLAY_ENABLED=true` when a camera connected directly to the computer must upload rewindable replay to R2. The wireless phone page always attempts the replay upload because other devices cannot access the phone's local storage.
 5. Add `CLOUDFLARE_STREAM_ACCOUNT_ID` to the local environment and Vercel.
 6. Add `CLOUDFLARE_STREAM_API_TOKEN` to the local environment and Vercel. This secret must never use a `NEXT_PUBLIC_` prefix.
 7. Set `CLOUDFLARE_STREAM_RECORDING_MODE` to `off` when the local files remain the recording source, or `automatic` when an additional Stream recording is required.
 8. Optionally set `CLOUDFLARE_STREAM_ALLOWED_ORIGINS` to a comma-separated list of authorised hostnames.
 9. Redeploy Live Game after changing the variables.
+
+The wireless phone button is available only when Stream is configured. R2 credentials and the production-domain CORS entry are also required for shared rewind and clip export. Cloudflare Stream carries the current live image; R2 stores the independent ten-second replay segments. The Stream API token and R2 credentials remain server-side and are never included in the QR code.
 
 When both optional flags are disabled, starting and reviewing the match does not require Cloudflare media services and no automatic replay upload is attempted.
 

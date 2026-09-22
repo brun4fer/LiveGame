@@ -48,7 +48,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [pendingHref, setPendingHref] = useState<string | null>(null);
   const [presence, setPresence] = useState<Presence | null>(null);
   const [presenceAcknowledged, setPresenceAcknowledged] = useState(false);
-  const isPublic = PUBLIC_PATHS.includes(pathname);
+  const isPublic = PUBLIC_PATHS.includes(pathname) || pathname.startsWith("/camera/");
 
   useEffect(() => {
     if (!isPublic) {

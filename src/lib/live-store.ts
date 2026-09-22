@@ -84,13 +84,30 @@ export async function getLiveSession(liveSessionId: string) {
 
 export async function startLiveSession(matchId: string, input: Record<string, unknown>) {
   const { user, workspace } = await requireWorkspace();
-  const match = await prisma.match.findFirstOrThrow({ where: { id: matchId, workspaceId: workspace.id }, select: { id: true, title: true } });
+  return startLiveSessionForIdentity(matchId, input, { userId: user.id, workspaceId: workspace.id });
+}
+
+async function startLiveSessionForIdentity(matchId: string, input: Record<string, unknown>, identity: { userId: string; workspaceId: string }) {
+  const { userId, workspaceId } = identity;
+  const match = await prisma.match.findFirstOrThrow({ where: { id: matchId, workspaceId }, select: { id: true, title: true } });
   const existing = await prisma.liveSession.findFirst({ where: { matchId, status: { in: [LiveSessionStatus.PREPARING, LiveSessionStatus.LIVE] } }, include: liveSessionInclude });
   if (existing) {
-    const serialized = serializeLiveSession(existing as never);
-    if (!cloudflareStreamConfigured() || existing.startedByUserId !== user.id || existing.provider !== "cloudflare-stream" || !existing.providerSessionId) return serialized;
+    let active = existing;
+    if (input.enableRealtime === true && cloudflareStreamConfigured() && (existing.provider !== "cloudflare-stream" || !existing.providerSessionId)) {
+      const realtime = await createRealtimeLiveInput({ name: match.title, matchId: match.id, workspaceId });
+      if (realtime) {
+        active = await prisma.liveSession.update({
+          where: { id: existing.id },
+          data: { provider: "cloudflare-stream", providerSessionId: realtime.id, playbackUrl: realtime.playbackUrl },
+          include: liveSessionInclude,
+        });
+        return { ...serializeLiveSession(active as never), publishUrl: realtime.publishUrl, realtimeAvailable: true, realtimeError: null };
+      }
+    }
+    const serialized = serializeLiveSession(active as never);
+    if (!cloudflareStreamConfigured() || active.provider !== "cloudflare-stream" || !active.providerSessionId) return serialized;
     try {
-      const realtime = await getRealtimeLiveInput(existing.providerSessionId);
+      const realtime = await getRealtimeLiveInput(active.providerSessionId);
       return { ...serialized, publishUrl: realtime?.publishUrl ?? null, realtimeAvailable: Boolean(realtime) };
     } catch (error) {
       return { ...serialized, publishUrl: null, realtimeAvailable: false, realtimeError: error instanceof Error ? error.message : "Realtime video could not be resumed." };
@@ -102,14 +119,14 @@ export async function startLiveSession(matchId: string, input: Record<string, un
   let realtime: Awaited<ReturnType<typeof createRealtimeLiveInput>> = null;
   let realtimeError: string | null = null;
   try {
-    if (input.enableRealtime === true && cloudflareStreamConfigured()) realtime = await createRealtimeLiveInput({ name: match.title, matchId: match.id, workspaceId: workspace.id });
+    if (input.enableRealtime === true && cloudflareStreamConfigured()) realtime = await createRealtimeLiveInput({ name: match.title, matchId: match.id, workspaceId });
   } catch (error) {
     realtimeError = error instanceof Error ? error.message : "Cloudflare Stream could not be started.";
   }
   const created = await prisma.liveSession.create({
     data: {
       matchId,
-      startedByUserId: user.id,
+      startedByUserId: userId,
       sourceType,
       status: LiveSessionStatus.LIVE,
       startedAt: createdAt,
@@ -128,6 +145,13 @@ export async function startLiveSession(matchId: string, input: Record<string, un
   };
 }
 
+export async function startPairedCameraSession(matchId: string, workspaceId: string, userId: string) {
+  if (!cloudflareStreamConfigured()) throw new Error("Cloudflare Stream is not configured for wireless camera transmission.");
+  const session = await startLiveSessionForIdentity(matchId, { sourceType: "BROWSER_CAMERA", enableRealtime: true }, { workspaceId, userId });
+  if (!("publishUrl" in session) || !session.publishUrl) throw new Error("The wireless live input could not be prepared. Generate a new pairing link and try again.");
+  return session;
+}
+
 export async function stopLiveSession(matchId: string) {
   const { workspace } = await requireWorkspace();
   const session = await prisma.liveSession.findFirst({ where: { matchId, match: { workspaceId: workspace.id }, status: { in: [LiveSessionStatus.PREPARING, LiveSessionStatus.LIVE] } } });
@@ -138,14 +162,18 @@ export async function stopLiveSession(matchId: string) {
 
 export async function prepareRecordingSegment(liveSessionId: string, input: Record<string, unknown>) {
   const { workspace } = await requireWorkspace();
+  return prepareRecordingSegmentForWorkspace(workspace.id, undefined, liveSessionId, input);
+}
+
+async function prepareRecordingSegmentForWorkspace(workspaceId: string, matchId: string | undefined, liveSessionId: string, input: Record<string, unknown>) {
   const sequence = Number(input.sequence);
   const startedAtSeconds = Number(input.startedAtSeconds);
   const mimeType = String(input.mimeType || "video/webm").split(";", 1)[0].trim().toLowerCase();
   if (!Number.isInteger(sequence) || sequence < 0) throw new Error("Invalid recording segment sequence.");
   if (!Number.isFinite(startedAtSeconds) || startedAtSeconds < 0) throw new Error("Invalid recording segment time.");
   if (!mimeType.startsWith("video/")) throw new Error("Invalid recording segment format.");
-  const session = await prisma.liveSession.findFirstOrThrow({ where: { id: liveSessionId, match: { workspaceId: workspace.id }, status: LiveSessionStatus.LIVE } });
-  const storageKey = `workspaces/${workspace.id}/live/${session.id}/segments/${String(sequence).padStart(8, "0")}`;
+  const session = await prisma.liveSession.findFirstOrThrow({ where: { id: liveSessionId, ...(matchId ? { matchId } : {}), match: { workspaceId }, status: LiveSessionStatus.LIVE } });
+  const storageKey = `workspaces/${workspaceId}/live/${session.id}/segments/${String(sequence).padStart(8, "0")}`;
   const segment = await prisma.recordingSegment.upsert({
     where: { liveSessionId_sequence: { liveSessionId, sequence } },
     create: { liveSessionId, sequence, startedAtSeconds, storageKey, mimeType },
@@ -154,13 +182,21 @@ export async function prepareRecordingSegment(liveSessionId: string, input: Reco
   return { id: segment.id, uploadUrl: createObjectUploadUrl(storageKey), storageKey, sequence };
 }
 
+export function preparePairedRecordingSegment(workspaceId: string, matchId: string, liveSessionId: string, input: Record<string, unknown>) {
+  return prepareRecordingSegmentForWorkspace(workspaceId, matchId, liveSessionId, input);
+}
+
 export async function completeRecordingSegment(liveSessionId: string, segmentId: string, input: Record<string, unknown>) {
   const { workspace } = await requireWorkspace();
+  return completeRecordingSegmentForWorkspace(workspace.id, undefined, liveSessionId, segmentId, input);
+}
+
+async function completeRecordingSegmentForWorkspace(workspaceId: string, matchId: string | undefined, liveSessionId: string, segmentId: string, input: Record<string, unknown>) {
   const durationSeconds = Number(input.durationSeconds);
   const fileSize = Number(input.fileSize);
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0 || durationSeconds > MAX_SEGMENT_SECONDS) throw new Error("Invalid recording segment duration.");
   if (!Number.isSafeInteger(fileSize) || fileSize <= 0) throw new Error("Invalid recording segment size.");
-  const segment = await prisma.recordingSegment.findFirstOrThrow({ where: { id: segmentId, liveSessionId, liveSession: { match: { workspaceId: workspace.id }, status: { in: [LiveSessionStatus.LIVE, LiveSessionStatus.ENDED] } } } });
+  const segment = await prisma.recordingSegment.findFirstOrThrow({ where: { id: segmentId, liveSessionId, liveSession: { ...(matchId ? { matchId } : {}), match: { workspaceId }, status: { in: [LiveSessionStatus.LIVE, LiveSessionStatus.ENDED] } } } });
   const now = new Date();
   const saved = await prisma.$transaction(async (tx) => {
     const row = await tx.recordingSegment.update({ where: { id: segment.id }, data: { durationSeconds, fileSize: BigInt(fileSize), status: RecordingSegmentStatus.READY, readyAt: now } });
@@ -170,10 +206,22 @@ export async function completeRecordingSegment(liveSessionId: string, segmentId:
   return serializeSegment(saved);
 }
 
+export function completePairedRecordingSegment(workspaceId: string, matchId: string, liveSessionId: string, segmentId: string, input: Record<string, unknown>) {
+  return completeRecordingSegmentForWorkspace(workspaceId, matchId, liveSessionId, segmentId, input);
+}
+
 export async function failRecordingSegment(liveSessionId: string, segmentId: string) {
   const { workspace } = await requireWorkspace();
-  const segment = await prisma.recordingSegment.findFirstOrThrow({ where: { id: segmentId, liveSessionId, liveSession: { match: { workspaceId: workspace.id } } } });
+  return failRecordingSegmentForWorkspace(workspace.id, undefined, liveSessionId, segmentId);
+}
+
+async function failRecordingSegmentForWorkspace(workspaceId: string, matchId: string | undefined, liveSessionId: string, segmentId: string) {
+  const segment = await prisma.recordingSegment.findFirstOrThrow({ where: { id: segmentId, liveSessionId, liveSession: { ...(matchId ? { matchId } : {}), match: { workspaceId } } } });
   await prisma.recordingSegment.update({ where: { id: segment.id }, data: { status: RecordingSegmentStatus.FAILED } });
+}
+
+export function failPairedRecordingSegment(workspaceId: string, matchId: string, liveSessionId: string, segmentId: string) {
+  return failRecordingSegmentForWorkspace(workspaceId, matchId, liveSessionId, segmentId);
 }
 
 export async function markLiveMoment(matchId: string, input: Record<string, unknown>) {

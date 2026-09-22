@@ -3,10 +3,11 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, AlertTriangle, ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Loader2, Pause, Pencil, Play, Radio, RotateCcw, RotateCw, Settings2, Trash2, Users, Video, X } from "lucide-react";
+import { Activity, AlertTriangle, ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Loader2, Pause, Pencil, Play, Radio, RotateCcw, RotateCw, Settings2, Smartphone, Trash2, Users, Video, X } from "lucide-react";
 
 import { MatchEditDialog } from "@/components/match-edit-dialog";
 import { MomentEditDialog } from "@/components/moment-edit-dialog";
+import { PhoneCameraPairingDialog } from "@/components/phone-camera-pairing-dialog";
 import { Badge, Button, Panel, Select } from "@/components/ui";
 import type { AccountPayload, LiveSegmentRecord, LiveSessionRecord, MatchDetail, MomentRecord, SettingsPayload } from "@/lib/domain";
 import { apiFetch } from "@/lib/http";
@@ -323,6 +324,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [editingMoment, setEditingMoment] = useState<MomentRecord | null>(null);
   const [exportingMomentId, setExportingMomentId] = useState<string | null>(null);
   const [editingMatch, setEditingMatch] = useState(false);
+  const [pairingPhone, setPairingPhone] = useState(false);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const [liveViewers, setLiveViewers] = useState<LiveViewer[]>([]);
@@ -490,7 +492,12 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const activeSegmentSeconds = recording && segmentStartedAtClockRef.current
     ? Math.max(0, (clock - segmentStartedAtClockRef.current) / 1000)
     : 0;
-  const liveEdgeSeconds = Math.max(availableEdgeSeconds, segmentTimelineCursorRef.current + activeSegmentSeconds);
+  const latestRemoteSegment = session?.segments.filter((segment) => segment.status === "READY").at(-1);
+  const remoteSegmentClock = latestRemoteSegment?.readyAt || session?.recordingStartedAt;
+  const remoteActiveSeconds = remoteLiveStream && remoteSegmentClock
+    ? Math.min(12, Math.max(0, (clock - Date.parse(remoteSegmentClock)) / 1000))
+    : 0;
+  const liveEdgeSeconds = Math.max(availableEdgeSeconds + remoteActiveSeconds, segmentTimelineCursorRef.current + activeSegmentSeconds);
   const currentTime = atLiveEdge && (cameraConnected || remoteLiveStream) ? liveEdgeSeconds : playheadSeconds;
   const activeLive = session?.status === "LIVE";
   const canStartCameraRecording = !activeLive || session?.startedBy.id === account?.id;
@@ -540,7 +547,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         }
         viewerSessionRef.current = received;
         received.peer.onconnectionstatechange = () => {
-          if (!["failed", "closed"].includes(received.peer.connectionState) || cancelled || viewerSessionRef.current !== received) return;
+          if (!["failed", "closed", "disconnected"].includes(received.peer.connectionState) || cancelled || viewerSessionRef.current !== received) return;
           disconnect();
           retry();
         };
@@ -1599,6 +1606,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
               : void connectCamera()}
           disabled={pausing || stopping}
         ><Camera size={13} /></Button>
+        <Button size="icon" className="h-8 w-8" title="Connect a wireless phone camera" aria-label="Connect a wireless phone camera" onClick={() => setPairingPhone(true)} disabled={recording || stopping}><Smartphone size={13} /></Button>
         {!activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping}><Radio size={12} />{localParts.length ? "Start next part" : "Start live"}</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving part…" : "End part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End match"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Start next part</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End match</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || pausing || stopping}><Radio size={12} />{pausing ? "Saving part…" : "Start next part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || pausing || stopping}><CircleStop size={12} />End match</Button></>}
       </div>
     </Panel>
@@ -1655,6 +1663,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     <Timeline momentTypes={settings.momentTypes} moments={match.moments} duration={timelineDuration} selectedMomentId={selectedMomentId} onSelect={reviewMoment} />
     {editingMoment ? <MomentEditDialog moment={editingMoment} momentTypes={settings.momentTypes} duration={timelineDuration} onSave={updateMoment} onClose={() => setEditingMoment(null)} /> : null}
     {editingMatch ? <MatchEditDialog match={match} onSave={saveMatch} onDelete={removeCurrentMatch} onClose={() => setEditingMatch(false)} /> : null}
+    {pairingPhone ? <PhoneCameraPairingDialog matchId={matchId} onClose={() => setPairingPhone(false)} /> : null}
   </div>;
 }
 
