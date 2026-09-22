@@ -1653,7 +1653,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     </div>
 
     <Timeline momentTypes={settings.momentTypes} moments={match.moments} duration={timelineDuration} selectedMomentId={selectedMomentId} onSelect={reviewMoment} />
-    {editingMoment ? <MomentEditDialog moment={editingMoment} momentTypes={settings.momentTypes} currentTime={currentTime} duration={timelineDuration} onSave={updateMoment} onClose={() => setEditingMoment(null)} /> : null}
+    {editingMoment ? <MomentEditDialog moment={editingMoment} momentTypes={settings.momentTypes} duration={timelineDuration} onSave={updateMoment} onClose={() => setEditingMoment(null)} /> : null}
     {editingMatch ? <MatchEditDialog match={match} onSave={saveMatch} onDelete={removeCurrentMatch} onClose={() => setEditingMatch(false)} /> : null}
   </div>;
 }
