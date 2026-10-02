@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Camera, CircleStop, Loader2, Radio, RefreshCw, RotateCw, Wifi, WifiOff } from "lucide-react";
+import { AlertTriangle, Camera, Loader2, RefreshCw, RotateCw, Wifi, WifiOff } from "lucide-react";
 
 import { Button, Panel, Select } from "@/components/ui";
 import { closeWebRtcSession, publishCameraStream, type BrowserWebRtcSession } from "@/lib/cloudflare-webrtc";
@@ -13,6 +13,7 @@ type WakeLockHandle = { release(): Promise<void>; addEventListener(type: "releas
 type PairedSession = LiveSessionRecord & { publishUrl?: string | null; realtimeAvailable?: boolean; realtimeError?: string | null };
 type PreparedSegment = { id: string; uploadUrl: string; sequence: number };
 type RotatedResources = { stream: MediaStream; video: HTMLVideoElement; stop(): void };
+type RemoteControl = { desiredBroadcasting: boolean; endRequested: boolean; commandVersion: number; expiresAt: string };
 
 const SEGMENT_MS = 10_000;
 
@@ -78,6 +79,9 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
   const reconnectAttemptsRef = useRef(0);
   const wakeLockRef = useRef<WakeLockHandle | null>(null);
   const pendingUploadTasksRef = useRef(new Set<Promise<void>>());
+  const commandBusyRef = useRef(false);
+  const lastCommandVersionRef = useRef(0);
+  const lastAcknowledgedVersionRef = useRef(0);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState("");
   const [rotation, setRotation] = useState<CameraRotation>(0);
@@ -147,12 +151,17 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
     const actualId = source.getVideoTracks()[0]?.getSettings().deviceId;
     if (actualId) setDeviceId(actualId);
     setCameraReady(true);
+    await apiFetch<RemoteControl>(`/api/camera/${encodeURIComponent(token)}/control`, {
+      method: "PATCH",
+      body: JSON.stringify({ state: "READY", commandVersion: lastCommandVersionRef.current }),
+    });
+    lastAcknowledgedVersionRef.current = lastCommandVersionRef.current;
     for (const track of source.getVideoTracks()) track.addEventListener("ended", () => {
       setWarning("The camera signal was lost. Reconnect the device or choose the camera again.");
       if (broadcastingRef.current) setConnection("reconnecting");
     }, { once: true });
     return resources.stream;
-  }, [deviceId, rotation, stopCamera]);
+  }, [deviceId, rotation, stopCamera, token]);
 
   const uploadSegment = useCallback(async (sessionId: string, sequence: number, startedAtSeconds: number, blob: Blob, durationSeconds: number) => {
     if (!blob.size || durationSeconds <= 0) return;
@@ -164,7 +173,11 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
         body: JSON.stringify({ liveSessionId: sessionId, sequence, startedAtSeconds, mimeType: blob.type || "video/webm" }),
       });
       const uploaded = await fetch(prepared.uploadUrl, { method: "PUT", headers: { "Content-Type": blob.type || "video/webm" }, body: blob });
-      if (!uploaded.ok) throw new Error(`Replay upload failed (${uploaded.status}).`);
+      if (!uploaded.ok) {
+        const payload = await uploaded.text().catch(() => "");
+        const detail = payload.match(/<Message>([^<]+)<\/Message>/)?.[1] || payload.slice(0, 160);
+        throw new Error(`Replay upload failed (${uploaded.status})${detail ? `: ${detail}` : "."}`);
+      }
       await apiFetch(`/api/camera/${encodeURIComponent(token)}/segments/${prepared.id}`, {
         method: "PATCH",
         body: JSON.stringify({ liveSessionId: sessionId, durationSeconds, fileSize: blob.size }),
@@ -227,7 +240,7 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
     };
   }, []);
 
-  async function startBroadcast() {
+  async function startBroadcast(commandVersion?: number) {
     setStarting(true);
     setError(null);
     setWarning(null);
@@ -248,6 +261,17 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
       segmentGenerationRef.current += 1;
       recordSegment(session.id, segmentGenerationRef.current);
       await acquireWakeLock();
+      if (commandVersion !== undefined) {
+        try {
+          await apiFetch(`/api/camera/${encodeURIComponent(token)}/control`, {
+            method: "PATCH",
+            body: JSON.stringify({ state: "BROADCASTING", commandVersion }),
+          });
+          lastAcknowledgedVersionRef.current = commandVersion;
+        } catch {
+          setWarning("The live image started, but the computer has not confirmed it yet. Keep this page open while it reconnects.");
+        }
+      }
     } catch (reason) {
       broadcastingRef.current = false;
       setBroadcasting(false);
@@ -258,7 +282,7 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
     }
   }
 
-  async function stopBroadcast() {
+  async function stopBroadcast(commandVersion?: number) {
     if (stopping) return;
     setStopping(true);
     try {
@@ -280,6 +304,13 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
       await recorderStopped;
       await Promise.allSettled([...pendingUploadTasksRef.current]);
       await releaseWakeLock();
+      if (commandVersion !== undefined) {
+        await apiFetch(`/api/camera/${encodeURIComponent(token)}/control`, {
+          method: "PATCH",
+          body: JSON.stringify({ state: "READY", commandVersion }),
+        });
+        lastAcknowledgedVersionRef.current = commandVersion;
+      }
     } finally {
       setStopping(false);
     }
@@ -291,7 +322,7 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
     if (wasBroadcasting) await stopBroadcast();
     try {
       await connectCamera(nextDeviceId, rotation);
-      if (wasBroadcasting) await startBroadcast();
+      if (wasBroadcasting) await startBroadcast(lastCommandVersionRef.current);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The selected camera could not be opened.");
     }
@@ -304,11 +335,67 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
     if (wasBroadcasting) await stopBroadcast();
     try {
       await connectCamera(deviceId, next);
-      if (wasBroadcasting) await startBroadcast();
+      if (wasBroadcasting) await startBroadcast(lastCommandVersionRef.current);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The camera image could not be rotated.");
     }
   }
+
+  useEffect(() => {
+    if (!cameraReady) return;
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const syncControl = async () => {
+      try {
+        const control = await apiFetch<RemoteControl>(`/api/camera/${encodeURIComponent(token)}/control`);
+        if (cancelled) return;
+        lastCommandVersionRef.current = Math.max(lastCommandVersionRef.current, control.commandVersion);
+        if (commandBusyRef.current) return;
+        if (control.desiredBroadcasting && !broadcastingRef.current) {
+          commandBusyRef.current = true;
+          try {
+            await startBroadcast(control.commandVersion);
+          } finally {
+            commandBusyRef.current = false;
+          }
+        } else if (control.desiredBroadcasting && broadcastingRef.current && control.commandVersion > lastAcknowledgedVersionRef.current) {
+          await apiFetch(`/api/camera/${encodeURIComponent(token)}/control`, {
+            method: "PATCH",
+            body: JSON.stringify({ state: "BROADCASTING", commandVersion: control.commandVersion }),
+          });
+          lastAcknowledgedVersionRef.current = control.commandVersion;
+        } else if (!control.desiredBroadcasting && broadcastingRef.current) {
+          commandBusyRef.current = true;
+          try {
+            await stopBroadcast(control.commandVersion);
+            if (control.endRequested) setWarning("The match has ended on the computer. You can now close this page.");
+          } finally {
+            commandBusyRef.current = false;
+          }
+        } else if (!control.desiredBroadcasting && control.commandVersion > lastAcknowledgedVersionRef.current) {
+          await apiFetch(`/api/camera/${encodeURIComponent(token)}/control`, {
+            method: "PATCH",
+            body: JSON.stringify({ state: "READY", commandVersion: control.commandVersion }),
+          });
+          lastAcknowledgedVersionRef.current = control.commandVersion;
+          if (control.endRequested) setWarning("The match has ended on the computer. You can now close this page.");
+        }
+      } catch (reason) {
+        if (!cancelled) setWarning(reason instanceof Error ? reason.message : "The phone lost contact with the match computer.");
+      } finally {
+        if (!cancelled) timer = window.setTimeout(() => void syncControl(), 1_000);
+      }
+    };
+
+    void syncControl();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  // Command execution reads the current camera and broadcast state from refs.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraReady, token]);
 
   useEffect(() => {
     const visibility = () => { if (document.visibilityState === "visible" && broadcastingRef.current) void acquireWakeLock(); };
@@ -328,10 +415,16 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
       if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
       if (recorderRef.current?.state === "recording") recorderRef.current.stop();
       closeWebRtcSession(webRtcRef.current);
+      void fetch(`/api/camera/${encodeURIComponent(token)}/control`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ state: "DISCONNECTED", commandVersion: lastCommandVersionRef.current }),
+        keepalive: true,
+      });
       stopCamera();
       void releaseWakeLock();
     };
-  }, [acquireWakeLock, publish, releaseWakeLock, stopCamera]);
+  }, [acquireWakeLock, publish, releaseWakeLock, stopCamera, token]);
 
   return <main className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col gap-3 p-3 sm:p-5">
     <header className="flex items-center justify-between gap-3">
@@ -340,7 +433,7 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
     </header>
     <Panel className="relative flex min-h-0 flex-1 overflow-hidden bg-black">
       <video ref={previewRef} muted autoPlay playsInline className="h-full min-h-[55dvh] w-full object-contain" />
-      {!cameraReady ? <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center"><Camera size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">Use this phone as the match camera</h2><p className="mt-2 max-w-md text-sm text-slate-400">Turn the phone horizontally, allow camera access, then start the broadcast.</p><Button className="mt-5" variant="primary" onClick={() => void connectCamera().catch((reason) => setError(reason instanceof Error ? reason.message : "The camera could not be opened."))}><Camera size={16} />Connect camera</Button></div> : null}
+      {!cameraReady ? <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center"><Camera size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">Use this phone as the match camera</h2><p className="mt-2 max-w-md text-sm text-slate-400">Turn the phone horizontally and allow camera access. Recording will always be started and stopped on the match computer.</p><Button className="mt-5" variant="primary" onClick={() => void connectCamera().catch((reason) => setError(reason instanceof Error ? reason.message : "The camera could not be opened."))}><Camera size={16} />Connect camera</Button></div> : null}
       {broadcasting ? <span className="absolute left-3 top-3 rounded-md bg-red-600 px-2.5 py-1.5 text-xs font-bold text-white">● LIVE</span> : null}
     </Panel>
     {error ? <div role="alert" className="flex items-start gap-2 rounded-lg border border-red-400/30 bg-red-500/10 p-3 text-sm text-red-100"><AlertTriangle size={17} className="mt-0.5 shrink-0" /><span>{error}</span></div> : null}
@@ -348,8 +441,8 @@ export function PhoneCameraSender({ token, matchTitle }: { token: string; matchT
     <Panel className="flex flex-col gap-2 p-3 sm:flex-row sm:items-center">
       <Select aria-label="Phone camera" value={deviceId} onChange={(event) => void changeDevice(event.target.value)} disabled={starting || stopping} className="sm:flex-1">{devices.length ? devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>) : <option value="">Rear camera</option>}</Select>
       <Button onClick={() => void rotate()} disabled={!cameraReady || starting || stopping}><RotateCw size={15} />Rotate {rotation}°</Button>
-      {!broadcasting ? <Button variant="primary" onClick={() => void startBroadcast()} disabled={starting || stopping}>{starting || stopping ? <Loader2 size={15} className="animate-spin" /> : <Radio size={15} />}{stopping ? "Finalizing clips…" : starting ? "Starting…" : "Start broadcast"}</Button> : <Button variant="danger" onClick={() => void stopBroadcast()} disabled={stopping}>{stopping ? <Loader2 size={15} className="animate-spin" /> : <CircleStop size={15} />}{stopping ? "Finalizing clips…" : "Stop for interval"}</Button>}
+      <span className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-cyan-300/20 bg-cyan-300/10 px-3 text-sm text-cyan-100 sm:min-w-48">{starting || stopping ? <Loader2 size={15} className="animate-spin" /> : connection === "live" ? <Wifi size={15} /> : <WifiOff size={15} />}{stopping ? "Finalizing clips…" : starting ? "Starting from computer…" : broadcasting ? "Controlled by computer" : cameraReady ? "Waiting for computer" : "Camera not connected"}</span>
     </Panel>
-    <p className="px-1 text-center text-xs leading-5 text-slate-500">Keep this page open. Stopping for the interval preserves the recorded parts; press Start broadcast again for the second half. {pendingUploads ? `${pendingUploads} replay segment${pendingUploads === 1 ? "" : "s"} uploading.` : "Replay segments are up to date."}</p>
+    <p className="px-1 text-center text-xs leading-5 text-slate-500">Keep this page open and the screen awake. The match computer controls the start, interval, second half and end of the match. {pendingUploads ? `${pendingUploads} replay segment${pendingUploads === 1 ? "" : "s"} uploading.` : "Replay segments are up to date."}</p>
   </main>;
 }

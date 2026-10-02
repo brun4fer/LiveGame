@@ -64,7 +64,7 @@ export async function getCurrentLiveSession(matchId: string, afterSequence?: num
     include: {
       ...liveSessionInclude,
       segments: {
-        where: { status: RecordingSegmentStatus.READY, ...(afterSequence === undefined ? {} : { sequence: { gt: afterSequence } }) },
+        where: { status: { in: [RecordingSegmentStatus.READY, RecordingSegmentStatus.FAILED] }, ...(afterSequence === undefined ? {} : { sequence: { gt: afterSequence } }) },
         orderBy: { sequence: "asc" },
       },
     },
@@ -77,7 +77,7 @@ export async function getLiveSession(liveSessionId: string) {
   const { workspace } = await requireWorkspace();
   const session = await prisma.liveSession.findFirstOrThrow({
     where: { id: liveSessionId, match: { workspaceId: workspace.id } },
-    include: { ...liveSessionInclude, segments: { where: { status: RecordingSegmentStatus.READY }, orderBy: { sequence: "asc" } } },
+    include: { ...liveSessionInclude, segments: { where: { status: { in: [RecordingSegmentStatus.READY, RecordingSegmentStatus.FAILED] } }, orderBy: { sequence: "asc" } } },
   });
   return serializeLiveSession(session as never);
 }
@@ -165,14 +165,14 @@ export async function prepareRecordingSegment(liveSessionId: string, input: Reco
   return prepareRecordingSegmentForWorkspace(workspace.id, undefined, liveSessionId, input);
 }
 
-async function prepareRecordingSegmentForWorkspace(workspaceId: string, matchId: string | undefined, liveSessionId: string, input: Record<string, unknown>) {
+async function prepareRecordingSegmentForWorkspace(workspaceId: string, matchId: string | undefined, liveSessionId: string, input: Record<string, unknown>, allowEnded = false) {
   const sequence = Number(input.sequence);
   const startedAtSeconds = Number(input.startedAtSeconds);
   const mimeType = String(input.mimeType || "video/webm").split(";", 1)[0].trim().toLowerCase();
   if (!Number.isInteger(sequence) || sequence < 0) throw new Error("Invalid recording segment sequence.");
   if (!Number.isFinite(startedAtSeconds) || startedAtSeconds < 0) throw new Error("Invalid recording segment time.");
   if (!mimeType.startsWith("video/")) throw new Error("Invalid recording segment format.");
-  const session = await prisma.liveSession.findFirstOrThrow({ where: { id: liveSessionId, ...(matchId ? { matchId } : {}), match: { workspaceId }, status: LiveSessionStatus.LIVE } });
+  const session = await prisma.liveSession.findFirstOrThrow({ where: { id: liveSessionId, ...(matchId ? { matchId } : {}), match: { workspaceId }, status: allowEnded ? { in: [LiveSessionStatus.LIVE, LiveSessionStatus.ENDED] } : LiveSessionStatus.LIVE } });
   const storageKey = `workspaces/${workspaceId}/live/${session.id}/segments/${String(sequence).padStart(8, "0")}`;
   const segment = await prisma.recordingSegment.upsert({
     where: { liveSessionId_sequence: { liveSessionId, sequence } },
@@ -183,7 +183,7 @@ async function prepareRecordingSegmentForWorkspace(workspaceId: string, matchId:
 }
 
 export function preparePairedRecordingSegment(workspaceId: string, matchId: string, liveSessionId: string, input: Record<string, unknown>) {
-  return prepareRecordingSegmentForWorkspace(workspaceId, matchId, liveSessionId, input);
+  return prepareRecordingSegmentForWorkspace(workspaceId, matchId, liveSessionId, input, true);
 }
 
 export async function completeRecordingSegment(liveSessionId: string, segmentId: string, input: Record<string, unknown>) {

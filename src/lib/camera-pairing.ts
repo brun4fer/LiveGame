@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { prisma } from "@/lib/prisma";
 
@@ -35,6 +35,10 @@ export function createCameraPairingToken(input: Pick<CameraPairingPayload, "matc
   return { token: `${data}.${sign(data)}`, expiresAt: new Date(expiresAt).toISOString() };
 }
 
+export function cameraPairingTokenHash(token: string) {
+  return createHash("sha256").update(token).digest("hex");
+}
+
 export function readCameraPairingToken(token: string) {
   const [data, signature] = token.split(".");
   if (!data || !signature) return null;
@@ -61,4 +65,18 @@ export async function requireCameraPairing(token: string) {
   ]);
   if (!match || !user) throw new Error("This camera link no longer belongs to an active workspace.");
   return { payload, match };
+}
+
+export async function requireActiveCameraPairing(token: string) {
+  const pairing = await requireCameraPairing(token);
+  const connection = await prisma.wirelessCameraConnection.findFirst({
+    where: {
+      matchId: pairing.payload.matchId,
+      workspaceId: pairing.payload.workspaceId,
+      tokenHash: cameraPairingTokenHash(token),
+      expiresAt: { gt: new Date() },
+    },
+  });
+  if (!connection) throw new Error("This camera link was replaced or has expired. Scan the latest QR code from the match computer.");
+  return { ...pairing, connection };
 }

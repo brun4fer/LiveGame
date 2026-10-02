@@ -180,10 +180,11 @@ This method uses Wi-Fi or mobile data, not Bluetooth. Both devices must have a s
 3. Turn the phone horizontally and open the link in Chrome on Android or Safari on iPhone.
 4. Select **Connect camera** and allow camera and microphone access.
 5. Select the rear camera from the list. Use **Rotate** if the preview is not horizontal.
-6. Select **Start broadcast** and keep that page open with the screen unlocked.
-7. Open the same match on any staff computer. The live image appears automatically; each staff member can independently rewind or return to live.
+6. Keep the phone page open with the screen unlocked. It now displays **Waiting for computer**; there are no recording controls on the phone.
+7. Return to the match computer. When **Phone ready** appears, select **Start live**. The phone begins transmitting automatically.
+8. Open the same match on any other staff computer. No second QR code is required: the live image appears automatically and each staff member can independently rewind or return to live.
 
-At half-time, select **Stop for interval** on the phone. The uploaded replay and tagged moments remain available on the computers. Select **Start broadcast** on the same phone page for the second half; it continues the same match timeline.
+At half-time, select **End part** on the match computer. Live Game asks the phone to stop and waits for its final replay segment before confirming the interval. Select **Start next part** on the computer for the second half. Use **End match** on the computer after the final whistle. The phone remains a camera throughout and follows these commands automatically.
 
 If Wi-Fi drops briefly, the phone attempts to reconnect automatically. A warning about replay upload does not stop the live WebRTC image. A warning about the camera signal requires checking the phone camera permission or reopening the capture device.
 
@@ -524,6 +525,8 @@ This section is for the person deploying Live Game, not normal match-day users.
 2. Configure PostgreSQL, the authentication secret and Cloudflare R2 credentials.
 3. Run `npm install`.
 4. Run `npm run prisma:migrate` and `npm run prisma:seed` for a new database.
+
+For an existing deployed database, run `npx prisma migrate deploy` after pulling a version that contains new migrations. The wireless computer-control flow requires the `WirelessCameraConnection` migration before the new deployment receives traffic.
 5. Run `npm run media:push` when initialising the shared media database.
 6. Run `npm run dev` and open `http://localhost:3000`.
 
@@ -553,7 +556,7 @@ Cloudflare Stream is disabled by default while multi-device transmission is not 
 8. Optionally set `CLOUDFLARE_STREAM_ALLOWED_ORIGINS` to a comma-separated list of authorised hostnames.
 9. Redeploy Live Game after changing the variables.
 
-The wireless phone button is available only when Stream is configured. R2 credentials and the production-domain CORS entry are also required for shared rewind and clip export. Cloudflare Stream carries the current live image; R2 stores the independent ten-second replay segments. The Stream API token and R2 credentials remain server-side and are never included in the QR code.
+The wireless phone button is available only when Stream is configured. R2 credentials and the production-domain CORS entry are also required for shared rewind and clip export. Cloudflare Stream carries the current live image; R2 stores the independent ten-second replay segments. The database stores the short-lived remote-control state so the match computer can start and stop the paired phone reliably across Vercel instances. The Stream API token and R2 credentials remain server-side and are never included in the QR code.
 
 When both optional flags are disabled, starting and reviewing the match does not require Cloudflare media services and no automatic replay upload is attempted.
 

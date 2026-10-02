@@ -74,6 +74,20 @@ type LocalReplaySegment = {
   mimeType: string;
   blob: Blob;
 };
+type WirelessCameraStatus = {
+  paired: boolean;
+  online: boolean;
+  ready: boolean;
+  desiredBroadcasting: boolean;
+  broadcasting: boolean;
+  endRequested: boolean;
+  commandVersion: number;
+  acknowledgedVersion: number;
+  lastSeenAt: string | null;
+  broadcastStartedAt: string | null;
+  expiresAt: string | null;
+};
+type WirelessCameraCommandResult = WirelessCameraStatus & { session?: LiveSessionRecord };
 
 const periodMarkers: Array<[PeriodMarkerKey, string]> = [
   ["firstHalfStartSeconds", "Start 1st half"],
@@ -283,6 +297,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const cameraMuteTimerRef = useRef<number | null>(null);
   const cameraLossHandlingRef = useRef(false);
   const successfulCameraConnectionsRef = useRef(0);
+  const wirelessPartStartedAtRef = useRef(0);
 
   const [match, setMatch] = useState<MatchDetail | null>(null);
   const [settings, setSettings] = useState<SettingsPayload | null>(null);
@@ -326,6 +341,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [exportingMomentId, setExportingMomentId] = useState<string | null>(null);
   const [editingMatch, setEditingMatch] = useState(false);
   const [pairingPhone, setPairingPhone] = useState(false);
+  const [wirelessCamera, setWirelessCamera] = useState<WirelessCameraStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const [liveViewers, setLiveViewers] = useState<LiveViewer[]>([]);
@@ -425,6 +441,24 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     return () => window.clearInterval(timer);
   }, [applySession, matchId]);
 
+  useEffect(() => {
+    let stopped = false;
+    async function refreshWirelessCamera() {
+      try {
+        const status = await apiFetch<WirelessCameraStatus>(`/api/matches/${matchId}/camera-control`);
+        if (!stopped) setWirelessCamera(status);
+      } catch {
+        // Camera-control polling must not interrupt local capture or replay.
+      }
+    }
+    void refreshWirelessCamera();
+    const timer = window.setInterval(() => void refreshWirelessCamera(), 1_500);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [matchId]);
+
   useEffect(() => () => {
     recordingRef.current = false;
     cameraStreamGenerationRef.current += 1;
@@ -494,13 +528,21 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     ? Math.max(0, (clock - segmentStartedAtClockRef.current) / 1000)
     : 0;
   const latestRemoteSegment = session?.segments.filter((segment) => segment.status === "READY").at(-1);
-  const remoteSegmentClock = latestRemoteSegment?.readyAt || session?.recordingStartedAt;
-  const remoteActiveSeconds = remoteLiveStream && remoteSegmentClock
-    ? Math.min(12, Math.max(0, (clock - Date.parse(remoteSegmentClock)) / 1000))
+  const remoteClockCandidates = [latestRemoteSegment?.readyAt, wirelessCamera?.broadcastStartedAt, session?.recordingStartedAt]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => Date.parse(value))
+    .filter(Number.isFinite);
+  const remoteSegmentClock = remoteClockCandidates.length ? Math.max(...remoteClockCandidates) : null;
+  const wirelessPartActive = Boolean(wirelessCamera?.broadcasting);
+  const wirelessStartPending = Boolean(wirelessCamera?.desiredBroadcasting && !wirelessCamera.broadcasting);
+  const remoteActiveSeconds = (remoteLiveStream || wirelessPartActive) && remoteSegmentClock
+    ? Math.min(12, Math.max(0, (clock - remoteSegmentClock) / 1000))
     : 0;
   const liveEdgeSeconds = Math.max(availableEdgeSeconds + remoteActiveSeconds, segmentTimelineCursorRef.current + activeSegmentSeconds);
-  const currentTime = atLiveEdge && (cameraConnected || remoteLiveStream) ? liveEdgeSeconds : playheadSeconds;
+  const currentTime = atLiveEdge && (cameraConnected || remoteLiveStream || wirelessPartActive) ? liveEdgeSeconds : playheadSeconds;
   const activeLive = session?.status === "LIVE";
+  const wirelessMode = Boolean(wirelessCamera?.paired);
+  const partPaused = wirelessMode && activeLive ? !wirelessPartActive && !wirelessStartPending : paused;
   const canStartCameraRecording = !activeLive || session?.startedBy.id === account?.id;
   const currentPeriod = match ? getMatchPeriodAtTime(match, currentTime) : null;
   const lastMoment = match?.moments.reduce<MomentRecord | null>((latest, moment) => !latest || Date.parse(moment.createdAt) > Date.parse(latest.createdAt) ? moment : latest, null) || null;
@@ -645,6 +687,14 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     if (!pendingMomentReviewId || !match) return;
     const moment = match.moments.find((item) => item.id === pendingMomentReviewId);
     if (!moment) return setPendingMomentReviewId(null);
+    const failedSegment = session?.segments.find((segment) => segment.status === "FAILED"
+      && segment.startedAtSeconds < moment.endTimeSeconds
+      && segment.startedAtSeconds + 12 > moment.startTimeSeconds);
+    if (failedSegment) {
+      setPendingMomentReviewId(null);
+      setNotice("This clip was not uploaded to R2. Check the R2 credentials configured in Vercel and the upload warning on the phone.");
+      return;
+    }
     const sources: TimedVideoSource[] = readySegments
       .filter((segment) => segment.playbackUrl && segment.durationSeconds)
       .map((segment) => ({ sourceUrl: segment.playbackUrl!, startedAtSeconds: segment.startedAtSeconds, durationSeconds: segment.durationSeconds! }));
@@ -652,7 +702,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     setPendingMomentReviewId(null);
     setPreviewEnd(moment.endTimeSeconds);
     if (seekVirtual(moment.startTimeSeconds, true)) setNotice(`${moment.momentType.name} is ready for replay.`);
-  }, [match, pendingMomentReviewId, readySegments, seekVirtual]);
+  }, [match, pendingMomentReviewId, readySegments, seekVirtual, session?.segments]);
 
   const goLive = useCallback(() => {
     setPendingMomentReviewId(null);
@@ -692,11 +742,11 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
   const markMoment = useCallback(async (momentTypeId: string) => {
     if (!session || session.status !== "LIVE") return setNotice("Wait for the live session to start before tagging a moment.");
-    if (!recording && !remoteLiveStream) return setNotice("Start the next recording part before tagging a new moment.");
-    if (paused) return setNotice("Start the next recording part before tagging a new moment.");
+    if (!recording && !remoteLiveStream && !wirelessPartActive) return setNotice("Start the next recording part before tagging a new moment.");
+    if (partPaused) return setNotice("Start the next recording part before tagging a new moment.");
     const markedAtSeconds = atLiveEdge ? liveEdgeSeconds : playheadSeconds;
     const recordedPart = localParts.find((part) => markedAtSeconds >= part.startTimeSeconds - 0.05 && markedAtSeconds <= part.startTimeSeconds + part.durationSeconds + 0.05);
-    const partStartedAtSeconds = recordedPart?.startTimeSeconds ?? archivePartStartedAtRef.current;
+    const partStartedAtSeconds = recordedPart?.startTimeSeconds ?? (wirelessPartActive ? wirelessPartStartedAtRef.current : archivePartStartedAtRef.current);
     setBusyMomentTypeId(momentTypeId);
     try {
       const saved = await apiFetch<MomentRecord>(`/api/matches/${matchId}/live/moments`, {
@@ -711,7 +761,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     } finally {
       setBusyMomentTypeId(null);
     }
-  }, [atLiveEdge, liveEdgeSeconds, localParts, matchId, paused, playheadSeconds, recording, remoteLiveStream, session]);
+  }, [atLiveEdge, liveEdgeSeconds, localParts, matchId, partPaused, playheadSeconds, recording, remoteLiveStream, session, wirelessPartActive]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -1098,6 +1148,96 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     }
   }
 
+  async function waitForWirelessCamera(commandVersion: number, timeoutMs = 35_000) {
+    const deadline = Date.now() + timeoutMs;
+    let latest: WirelessCameraStatus | null = null;
+    while (Date.now() < deadline) {
+      latest = await apiFetch<WirelessCameraStatus>(`/api/matches/${matchId}/camera-control`);
+      setWirelessCamera(latest);
+      if (latest.acknowledgedVersion >= commandVersion && !latest.broadcasting) return latest;
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    }
+    throw new Error(latest?.online
+      ? "The phone is still finalizing the last replay clip. Keep both pages open and try again in a moment."
+      : "The phone camera is offline. Reopen the QR link on the phone before finishing this part.");
+  }
+
+  async function startWirelessPart() {
+    if (pausing || stopping) return;
+    setPausing(true);
+    try {
+      const result = await apiFetch<WirelessCameraCommandResult>(`/api/matches/${matchId}/camera-control`, {
+        method: "PATCH",
+        body: JSON.stringify({ command: "start" }),
+      });
+      setWirelessCamera(result);
+      if (result.session) applySession(result.session);
+      const edge = result.session ? getReplayEdge(result.session.segments.filter((segment) => segment.status === "READY")) : availableEdgeSeconds;
+      wirelessPartStartedAtRef.current = edge;
+      setPaused(false);
+      setAtLiveEdge(true);
+      setReplayTarget(null);
+      setNotice("The phone was told to start recording. Keep its camera page open; the live image will appear automatically.");
+      if (match?.firstHalfStartSeconds === null) await saveAutomaticPeriodMarker("firstHalfStartSeconds", edge);
+      else if (match && match.firstHalfEndSeconds !== null && match.secondHalfStartSeconds === null) await saveAutomaticPeriodMarker("secondHalfStartSeconds", edge);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The wireless camera could not be started.");
+    } finally {
+      setPausing(false);
+    }
+  }
+
+  async function pauseWirelessPart() {
+    if (pausing || stopping || !wirelessPartActive) return;
+    setPausing(true);
+    try {
+      const command = await apiFetch<WirelessCameraStatus>(`/api/matches/${matchId}/camera-control`, {
+        method: "PATCH",
+        body: JSON.stringify({ command: "stop" }),
+      });
+      setWirelessCamera(command);
+      await waitForWirelessCamera(command.commandVersion);
+      const refreshed = await apiFetch<LiveSessionRecord | null>(`/api/matches/${matchId}/live`);
+      applySession(refreshed);
+      const edge = refreshed ? getReplayEdge(refreshed.segments.filter((segment) => segment.status === "READY")) : liveEdgeSeconds;
+      setPaused(true);
+      setAtLiveEdge(false);
+      if (match?.firstHalfEndSeconds === null) await saveAutomaticPeriodMarker("firstHalfEndSeconds", edge);
+      setNotice("The recording part was finalized on the phone. All tagged clips remain available during the interval.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The phone could not finalize the recording part.");
+    } finally {
+      setPausing(false);
+    }
+  }
+
+  async function stopWirelessMatch() {
+    if (stopping) return;
+    setStopping(true);
+    try {
+      const command = await apiFetch<WirelessCameraStatus>(`/api/matches/${matchId}/camera-control`, {
+        method: "PATCH",
+        body: JSON.stringify({ command: "end" }),
+      });
+      setWirelessCamera(command);
+      await waitForWirelessCamera(command.commandVersion);
+      const ended = await apiFetch<LiveSessionRecord>(`/api/matches/${matchId}/live`, { method: "PATCH" });
+      applySession(ended);
+      setPaused(false);
+      setAtLiveEdge(false);
+      const edge = getReplayEdge(ended.segments.filter((segment) => segment.status === "READY"));
+      if (match && match.secondHalfStartSeconds !== null && match.secondHalfEndSeconds === null) await saveAutomaticPeriodMarker("secondHalfEndSeconds", edge);
+      else if (match?.firstHalfEndSeconds === null) await saveAutomaticPeriodMarker("firstHalfEndSeconds", edge);
+      const latest = ended.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl).at(-1);
+      if (latest) openSegment(latest, 0, false, false);
+      setNotice("The match ended. The phone finalized its last replay clip before the session was closed.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The wireless match could not be stopped cleanly.");
+    } finally {
+      setStopping(false);
+    }
+  }
+
   async function startLive() {
     const directory = archiveDirectoryRef.current || await chooseLocalRecordingFolder();
     if (!directory) return;
@@ -1473,6 +1613,10 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       await new Promise<void>((resolve) => window.setTimeout(resolve, 800));
       const latest = await apiFetch<LiveSessionRecord>(`/api/live-sessions/${session.id}`);
       applySession(latest);
+      const failed = latest.segments.some((segment) => segment.status === "FAILED"
+        && segment.startedAtSeconds < moment.endTimeSeconds
+        && segment.startedAtSeconds + 12 > moment.startTimeSeconds);
+      if (failed) throw new Error("The phone could not upload this clip to R2. Verify the R2 credentials in Vercel and the warning shown on the phone.");
       const cloudSegments = latest.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl);
       available = cloudReplaySegmentsForMoment(moment, cloudSegments);
       if (available) return available;
@@ -1645,17 +1789,17 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         <button type="button" title="Edit match" aria-label="Edit match" onClick={() => setEditingMatch(true)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-white/[.06] hover:text-white"><Settings2 size={13} /></button>
       </div>
       <div className="order-3 grid w-full min-w-0 grid-cols-2 gap-1.5 px-2 py-1.5 sm:grid-cols-3 lg:grid-cols-6 xl:order-none xl:flex xl:w-auto xl:items-center" aria-label="Tag the previous 20 seconds">
-        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; const taggingUnavailable = !activeLive || paused || (!recording && !remoteLiveStream); return <button key={type.id} type="button" disabled={taggingUnavailable || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 w-full min-w-0 items-center justify-start gap-1.5 rounded-md border px-2 text-left transition xl:flex-1 xl:basis-0 2xl:justify-between ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0 flex-1"><span className="line-clamp-2 text-[9px] font-bold leading-3 2xl:block 2xl:truncate" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 hidden text-[8px] text-slate-600 2xl:block">{busy ? "Saving…" : taggingUnavailable ? "Recording stopped" : "Previous 20s"}</span></span><kbd className="hidden shrink-0 rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300 2xl:inline-flex">{type.defaultShortcut || "—"}</kbd></button>; })}
+        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; const taggingUnavailable = !activeLive || partPaused || (!recording && !remoteLiveStream && !wirelessPartActive); return <button key={type.id} type="button" disabled={taggingUnavailable || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 w-full min-w-0 items-center justify-start gap-1.5 rounded-md border px-2 text-left transition xl:flex-1 xl:basis-0 2xl:justify-between ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0 flex-1"><span className="line-clamp-2 text-[9px] font-bold leading-3 2xl:block 2xl:truncate" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 hidden text-[8px] text-slate-600 2xl:block">{busy ? "Saving…" : taggingUnavailable ? "Recording stopped" : "Previous 20s"}</span></span><kbd className="hidden shrink-0 rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300 2xl:inline-flex">{type.defaultShortcut || "—"}</kbd></button>; })}
       </div>
       <div className="ml-auto flex min-w-0 items-center justify-end gap-1 border-l border-white/10 px-1.5 max-md:w-full max-md:border-b max-md:border-l-0 max-xl:flex-1">
-        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-28 sm:flex-none" value={deviceId} onChange={(event) => changeCameraDevice(event.target.value)} disabled={recording || pausing || stopping}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
-        <Select aria-label="Capture mode" title="Capture mode" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-24 sm:flex-none" value={captureMode} onChange={(event) => changeCaptureMode(event.target.value as CaptureMode)} disabled={recording || pausing || stopping}>
+        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-28 sm:flex-none" value={deviceId} onChange={(event) => changeCameraDevice(event.target.value)} disabled={wirelessMode || recording || pausing || stopping}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
+        <Select aria-label="Capture mode" title="Capture mode" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-24 sm:flex-none" value={captureMode} onChange={(event) => changeCaptureMode(event.target.value as CaptureMode)} disabled={wirelessMode || recording || pausing || stopping}>
           <option value="standard">Standard</option>
           <option value="compatibility">Compatibility 720p</option>
         </Select>
-        <Button size="sm" className="h-8 shrink-0 px-2 text-[10px]" title={`Rotate camera 90° clockwise · current rotation ${cameraRotation}°`} aria-label={`Rotate camera 90 degrees clockwise; current rotation ${cameraRotation} degrees`} onClick={() => void rotateCamera()} disabled={recording || pausing || stopping}><RotateCw size={12} />{cameraRotation}°</Button>
+        <Button size="sm" className="h-8 shrink-0 px-2 text-[10px]" title={`Rotate camera 90° clockwise · current rotation ${cameraRotation}°`} aria-label={`Rotate camera 90 degrees clockwise; current rotation ${cameraRotation} degrees`} onClick={() => void rotateCamera()} disabled={wirelessMode || recording || pausing || stopping}><RotateCw size={12} />{cameraRotation}°</Button>
         {cameraConnected || captureDiagnostics.reconnections > 0 ? <Badge className="hidden max-w-40 truncate border-cyan-300/20 bg-cyan-300/[.07] text-[9px] text-cyan-100 2xl:inline-flex" title={captureDiagnosticSummary}><Activity size={11} />{captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : captureProfiles[captureMode].label} · {captureDiagnostics.reconnections}R</Badge> : null}
-        {(recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : paused && localParts.length ? <Badge className="hidden border-amber-300/25 bg-amber-300/10 text-[9px] text-amber-100 2xl:inline-flex">{localParts.length} part{localParts.length === 1 ? "" : "s"} saved</Badge> : null}
+        {wirelessMode ? <Badge className={`hidden text-[9px] 2xl:inline-flex ${wirelessCamera?.ready ? "border-emerald-300/25 bg-emerald-300/10 text-emerald-100" : "border-amber-300/25 bg-amber-300/10 text-amber-100"}`}><Smartphone size={11} />{wirelessCamera?.broadcasting ? "Phone live" : wirelessCamera?.ready ? "Phone ready" : wirelessCamera?.online ? "Allow camera" : "Phone offline"}</Badge> : (recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : paused && localParts.length ? <Badge className="hidden border-amber-300/25 bg-amber-300/10 text-[9px] text-amber-100 2xl:inline-flex">{localParts.length} part{localParts.length === 1 ? "" : "s"} saved</Badge> : null}
         <Button
           size="icon"
           className="h-8 w-8"
@@ -1665,10 +1809,13 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
             : paused && activeLive
               ? void resumeRecording()
               : void connectCamera()}
-          disabled={pausing || stopping}
+          disabled={wirelessMode || pausing || stopping}
         ><Camera size={13} /></Button>
-        <Button size="icon" className="h-8 w-8" title="Connect a wireless phone camera" aria-label="Connect a wireless phone camera" onClick={() => setPairingPhone(true)} disabled={recording || stopping}><Smartphone size={13} /></Button>
-        {!activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping}><Radio size={12} />{localParts.length ? "Start next part" : "Start live"}</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving part…" : "End part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End match"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Start next part</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End match</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || pausing || stopping}><Radio size={12} />{pausing ? "Saving part…" : "Start next part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || pausing || stopping}><CircleStop size={12} />End match</Button></>}
+        <Button size="icon" className="h-8 w-8" title={wirelessMode ? "The wireless phone is already paired" : "Connect a wireless phone camera"} aria-label="Connect a wireless phone camera" onClick={() => setPairingPhone(true)} disabled={Boolean(wirelessCamera?.ready) || recording || wirelessPartActive || wirelessStartPending || stopping}><Smartphone size={13} /></Button>
+        {wirelessMode ? (!activeLive || partPaused
+          ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startWirelessPart()} disabled={!wirelessCamera?.ready || pausing || stopping}><Radio size={12} />{pausing ? "Starting…" : activeLive ? "Start next part" : wirelessCamera?.ready ? "Start live" : "Waiting for phone"}</Button>{activeLive ? <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopWirelessMatch()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End match"}</Button> : null}</>
+          : <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseWirelessPart()} disabled={wirelessStartPending || pausing || stopping}>{wirelessStartPending ? <Loader2 size={12} className="animate-spin" /> : <Pause size={12} />}{wirelessStartPending ? "Starting phone…" : pausing ? "Finalizing part…" : "End part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopWirelessMatch()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End match"}</Button></>)
+          : !activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping}><Radio size={12} />{localParts.length ? "Start next part" : "Start live"}</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving part…" : "End part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End match"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Start next part</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End match</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || pausing || stopping}><Radio size={12} />{pausing ? "Saving part…" : "Start next part"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || pausing || stopping}><CircleStop size={12} />End match</Button></>}
       </div>
     </Panel>
 
@@ -1689,9 +1836,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     <div className="grid min-h-0 flex-1 items-stretch gap-2 xl:grid-cols-[18rem_minmax(0,1fr)]">
       <Panel className="order-2 flex min-h-0 min-w-0 flex-col overflow-hidden">
         <div className="relative aspect-video min-h-72 shrink-0 bg-black xl:aspect-auto xl:min-h-0 xl:flex-1">
-          {atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{paused ? "Recording part saved" : activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : "Connect the match camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">{paused ? "Select a tagged moment to review it, or start the next recording part." : "Recording continues while you independently control replay."}</p></div>}
+          {atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{partPaused ? "Recording part saved" : activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : wirelessMode ? "Phone camera ready" : "Connect the match camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">{partPaused ? "Select a tagged moment to review it, or start the next recording part." : "Recording continues while you independently control replay."}</p></div>}
           {showingRemoteLive && remotePlaybackNeedsAction ? <button type="button" onClick={() => void remoteLiveVideoRef.current?.play()} className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm font-semibold text-white"><span className="rounded-lg border border-cyan-300/35 bg-pitch-950/90 px-4 py-3"><Play size={16} className="mr-2 inline" />Start live video</span></button> : null}
-          {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${paused ? "bg-amber-600" : "bg-red-600"}`}>{paused ? "INTERVAL · PART SAVED" : "● RECORDING"}</span> : null}
+          {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${partPaused ? "bg-amber-600" : "bg-red-600"}`}>{partPaused ? "INTERVAL · PART SAVED" : "● RECORDING"}</span> : null}
           {activeLive ? <span className={`absolute right-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold ${atLiveEdge ? "bg-cyan-300 text-slate-950" : "bg-slate-900/85 text-cyan-100"}`}>{atLiveEdge ? "LIVE" : `REPLAY · ${formatTime(behindLive)} behind`}</span> : null}
           {atLiveEdge && cameraConnected ? <span className="absolute bottom-3 left-3 max-w-[calc(100%-1.5rem)] truncate rounded-md border border-white/10 bg-slate-950/75 px-2 py-1 font-mono text-[9px] text-slate-300 backdrop-blur-sm" title={captureDiagnosticSummary}><Activity size={10} className="mr-1 inline text-cyan-300" />{captureProfiles[captureMode].label} · {captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : "detecting"} · {captureDiagnostics.frameRate ? `${Math.round(captureDiagnostics.frameRate)}fps` : "fps—"} · {captureDiagnostics.reconnections}R</span> : null}
         </div>

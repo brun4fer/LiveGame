@@ -234,6 +234,30 @@ model LiveSession {
   @@index([startedByUserId])
 }
 
+/// Persistent control channel between the match computer and a paired phone.
+/// The phone owns the camera; the authenticated match computer owns the commands.
+model WirelessCameraConnection {
+  id                  String   @id @default(cuid())
+  matchId             String   @unique
+  workspaceId         String
+  pairedByUserId      String
+  tokenHash           String   @unique
+  expiresAt           DateTime
+  ready               Boolean  @default(false)
+  desiredBroadcasting Boolean  @default(false)
+  broadcasting        Boolean  @default(false)
+  endRequested        Boolean  @default(false)
+  commandVersion      Int      @default(0)
+  acknowledgedVersion Int      @default(0)
+  lastSeenAt          DateTime?
+  broadcastStartedAt  DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([workspaceId, lastSeenAt])
+  @@index([expiresAt])
+}
+
 model RecordingSegment {
   id                 String                 @id @default(cuid())
   liveSessionId      String
