@@ -167,6 +167,18 @@ If using a capture card, select it as the camera source. Test audio and video be
 
 Live Game creates an `.mp4` file named after the match and timestamp. At the same time, it creates short internal cloud replay segments so staff can rewind during the live event.
 
+### Use a YouTube link instead of a local camera
+
+When another person is already broadcasting the match on YouTube, the analysis computer does not need a camera or capture cable:
+
+1. Open the match in **Live Game**.
+2. Select the link button beside the camera and phone buttons.
+3. Paste a normal YouTube video or live-stream URL and select **Show video**.
+4. The video appears inside the match workspace. Every signed-in staff member who opens the same match sees that source.
+5. Tag moments with the usual buttons. Select **End link** when the analysis session finishes.
+
+The YouTube player remains responsible for play, pause, live delay and sound. A YouTube link can be used for viewing and tagging, but the browser cannot directly cut and export that third-party stream. Clip export remains available for locally recorded or uploaded match video.
+
 When Cloudflare Stream is explicitly enabled and configured, **Start live** also publishes the same camera and audio through WebRTC. Staff accounts that open the same match automatically receive the live image. They do not need a camera connected to their own devices.
 
 The first replay segment normally becomes available after approximately five seconds. Recording continues when a user rewinds, pauses, reviews a clip or returns to live.
@@ -330,6 +342,8 @@ Select **Identify submoments** after at least one main moment exists.
 
 Saved submoments appear below the form. Select one to return to its timestamp, use the pencil to edit it or the bin to delete it.
 
+Use the green and red circular buttons to classify both the selected main moment and each saved submoment. Selecting the active colour again clears the result.
+
 ## Use Playlists
 
 Every staff member has a default personal playlist. A live moment is automatically added to the default playlist of the person who tagged it.
@@ -363,6 +377,12 @@ Reports combine moments from one or more matches.
 4. Keep the page open until all clips have been processed.
 
 Use **Load local fallback** when cloud video is unavailable. Select the corresponding original files; Live Game matches them by filename. Exporting creates new clips and does not modify the original recording.
+
+### Sound in playback and exports
+
+Video sound is disabled by default. Use the speaker button to enable it. The preference is shared by the Live Game video workspaces and also controls exports: **Without audio** creates silent MP4 clips; **With audio** preserves the source audio when the browser can read it. Reports show the same choice beside the export-quality filter.
+
+Moment results in Reports use the same green and red circular buttons as the tagging workspace. Select a colour to set the result, or select the active colour again to clear it.
 
 ## Use Maps
 

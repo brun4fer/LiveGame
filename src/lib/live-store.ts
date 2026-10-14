@@ -4,6 +4,7 @@ import { requireWorkspace } from "@/lib/auth";
 import { cloudflareStreamConfigured, createRealtimeLiveInput, getRealtimeLiveInput } from "@/lib/cloudflare-stream";
 import { getMatchPeriodAtTime } from "@/lib/match-periods";
 import { prisma } from "@/lib/prisma";
+import { normalizeYouTubeUrl } from "@/lib/external-video";
 import { createObjectUploadUrl, createPlaybackUrl } from "@/lib/r2";
 
 export const DEFAULT_LIVE_LEAD_SECONDS = 20;
@@ -90,8 +91,11 @@ export async function startLiveSession(matchId: string, input: Record<string, un
 async function startLiveSessionForIdentity(matchId: string, input: Record<string, unknown>, identity: { userId: string; workspaceId: string }) {
   const { userId, workspaceId } = identity;
   const match = await prisma.match.findFirstOrThrow({ where: { id: matchId, workspaceId }, select: { id: true, title: true } });
+  const externalLink = input.externalLink === true;
+  const externalPlaybackUrl = externalLink ? normalizeYouTubeUrl(String(input.playbackUrl || "")) : null;
   const existing = await prisma.liveSession.findFirst({ where: { matchId, status: { in: [LiveSessionStatus.PREPARING, LiveSessionStatus.LIVE] } }, include: liveSessionInclude });
   if (existing) {
+    if (externalLink && existing.provider !== "external-link") throw new Error("End the current live session before switching to a YouTube link.");
     let active = existing;
     if (input.enableRealtime === true && cloudflareStreamConfigured() && (existing.provider !== "cloudflare-stream" || !existing.providerSessionId)) {
       const realtime = await createRealtimeLiveInput({ name: match.title, matchId: match.id, workspaceId });
@@ -131,9 +135,9 @@ async function startLiveSessionForIdentity(matchId: string, input: Record<string
       status: LiveSessionStatus.LIVE,
       startedAt: createdAt,
       recordingStartedAt: createdAt,
-      provider: realtime ? "cloudflare-stream" : "segment-dvr",
+      provider: externalLink ? "external-link" : realtime ? "cloudflare-stream" : "segment-dvr",
       providerSessionId: realtime?.id ?? null,
-      playbackUrl: realtime?.playbackUrl ?? (typeof input.playbackUrl === "string" && input.playbackUrl.trim() ? input.playbackUrl.trim() : null),
+      playbackUrl: externalPlaybackUrl ?? realtime?.playbackUrl ?? (typeof input.playbackUrl === "string" && input.playbackUrl.trim() ? input.playbackUrl.trim() : null),
     },
     include: liveSessionInclude,
   });

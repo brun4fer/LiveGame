@@ -39,6 +39,7 @@ type ExportMomentInput = {
   quality?: ExportQuality;
   onStatus?: (status: string) => void;
   sourceUrlFallback?: string;
+  includeAudio?: boolean;
 };
 
 // Only remux when the saved mark is effectively on the keyframe. Otherwise an
@@ -82,12 +83,13 @@ export class SmartVideoExportSession {
     quality = "high",
     onStatus,
     sourceUrlFallback,
+    includeAudio = false,
   }: ExportMomentInput): Promise<SmartExportResult> {
     await this.validate();
 
     onStatus?.("Checking whether the clip can be copied without re-encoding...");
     try {
-      const direct = await this.tryDirectExport(match, moment, onStatus);
+      const direct = await this.tryDirectExport(match, moment, includeAudio, onStatus);
       if (direct) {
         return direct;
       }
@@ -97,7 +99,7 @@ export class SmartVideoExportSession {
 
     onStatus?.("Encoding an exact cut with WebCodecs...");
     try {
-      return await this.exportWithWebCodecs(match, moment, quality, onStatus);
+      return await this.exportWithWebCodecs(match, moment, quality, includeAudio, onStatus);
     } catch (error) {
       console.info("WebCodecs export was not possible. Trying compatibility mode.", error);
       if (!sourceUrlFallback) {
@@ -111,6 +113,7 @@ export class SmartVideoExportSession {
       match,
       moment,
       quality,
+      includeAudio,
       onStatus,
     });
     return { ...legacy, mode: "compatibility" };
@@ -133,12 +136,13 @@ export class SmartVideoExportSession {
   private async tryDirectExport(
     match: MatchForExport,
     moment: MomentRecord,
+    includeAudio: boolean,
     onStatus?: (status: string) => void,
   ): Promise<SmartExportResult | null> {
     const videoTrack = await this.getVideoTrack();
     if (!videoTrack) return null;
 
-    const audioTrack = await this.getAudioTrack();
+    const audioTrack = includeAudio ? await this.getAudioTrack() : null;
     const format = new Mp4OutputFormat({ fastStart: "in-memory" });
     const videoCodec = await videoTrack.getCodec();
     const audioCodec = await audioTrack?.getCodec();
@@ -236,6 +240,7 @@ export class SmartVideoExportSession {
     match: MatchForExport,
     moment: MomentRecord,
     quality: ExportQuality,
+    includeAudio: boolean,
     onStatus?: (status: string) => void,
   ): Promise<SmartExportResult> {
     if (typeof VideoEncoder === "undefined" || typeof VideoDecoder === "undefined") {
@@ -258,10 +263,10 @@ export class SmartVideoExportSession {
         keyFrameInterval: 2,
         hardwareAcceleration: "no-preference",
       },
-      audio: {
+      audio: includeAudio ? {
         codec: "aac",
         bitrate: settings.audioBitrate,
-      },
+      } : { discard: true },
       showWarnings: false,
     });
 
