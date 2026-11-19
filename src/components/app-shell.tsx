@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, BarChart3, CircleHelp, Goal, Home, ListVideo, LockKeyhole, LogOut, Map, Plus, Settings, Wrench } from "lucide-react";
+import { AlertTriangle, ArrowLeft, BarChart3, CircleHelp, Goal, Home, ListVideo, LockKeyhole, LogOut, Map, Plus, Settings, Wrench } from "lucide-react";
 
 import { ManagementAccessDialog } from "@/components/management-access-dialog";
 import { Button, Label, Panel } from "@/components/ui";
@@ -22,6 +22,7 @@ const links = [
   { href: "/settings", label: "Settings", icon: Settings, protected: true },
   { href: "/help", label: "Help", icon: CircleHelp, protected: false },
 ];
+const PORTAL_URL = "https://ap-football-portal.vercel.app";
 
 const PUBLIC_PATHS = ["/login", "/register", "/change-password", "/onboarding"];
 const MANAGEMENT_PASSWORD_ENABLED = isManagementPasswordEnabled();
@@ -120,6 +121,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </Link>
 
           <div className="flex min-w-0 items-center gap-2">
+            <a href={PORTAL_URL} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-md px-2 text-xs text-cyan-100 transition hover:bg-cyan-300/10 hover:text-cyan-200" title="Voltar ao All-in-One Football Ecosystem">
+              <ArrowLeft size={16} /> <span className="hidden 2xl:inline">All-in-One</span>
+            </a>
             <nav className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto rounded-lg border border-white/10 bg-white/[.03] p-1 sm:flex-none">
               {links.map(({ href, label, icon: Icon, protected: needsManagement }) => {
                 const active = href === "/" ? pathname === "/" : pathname.startsWith(href);
