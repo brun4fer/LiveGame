@@ -22,9 +22,9 @@ export function CloudVideoLibrary({ assets, loading, error, attachingAssetId, on
       <Panel className="flex max-h-[80dvh] w-full max-w-2xl flex-col overflow-hidden">
         <div className="flex items-start justify-between gap-4 border-b border-white/10 p-4">
           <div>
-            <div className="flex items-center gap-2 text-cyan-200"><FolderOpen size={18} /><Label>Shared cloud library</Label></div>
+            <div className="flex items-center gap-2 text-cyan-200"><FolderOpen size={18} /><Label>Cloud library for this software</Label></div>
             <h2 className="mt-2 text-lg font-bold text-white">Choose an existing video</h2>
-            <p className="mt-1 text-xs text-slate-400">Only videos belonging to this workspace are shown. Selecting one does not upload another copy.</p>
+            <p className="mt-1 text-xs text-slate-400">Only videos uploaded in this software for this workspace are shown. Selecting one does not upload another copy.</p>
           </div>
           <Button size="icon" disabled={Boolean(attachingAssetId)} onClick={onClose} aria-label="Close cloud library"><X size={17} /></Button>
         </div>
@@ -51,7 +51,7 @@ export function CloudVideoLibrary({ assets, loading, error, attachingAssetId, on
               ))}
             </div>
           ) : (
-            <div className="flex h-40 flex-col items-center justify-center text-center"><Cloud size={30} className="text-slate-600" /><p className="mt-3 text-sm font-medium text-slate-300">No shared videos yet</p><p className="mt-1 text-xs text-slate-500">Use Upload new to add the first video to this workspace.</p></div>
+            <div className="flex h-40 flex-col items-center justify-center text-center"><Cloud size={30} className="text-slate-600" /><p className="mt-3 text-sm font-medium text-slate-300">No videos in this software yet</p><p className="mt-1 text-xs text-slate-500">Use Upload new to add the first video to this workspace.</p></div>
           )}
         </div>
       </Panel>
