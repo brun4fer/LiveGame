@@ -121,7 +121,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </Link>
 
           <div className="flex min-w-0 items-center gap-2">
-            <a href={PORTAL_URL} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-md px-2 text-xs text-cyan-100 transition hover:bg-cyan-300/10 hover:text-cyan-200" title="Voltar ao All-in-One Football Ecosystem">
+            <a href={PORTAL_URL} target="_blank" rel="noreferrer" className="inline-flex h-9 shrink-0 items-center gap-2 rounded-md px-2 text-xs text-cyan-100 transition hover:bg-cyan-300/10 hover:text-cyan-200" title="Abrir o All-in-One Football Ecosystem fora desta aplicação">
               <ArrowLeft size={16} /> <span className="hidden 2xl:inline">All-in-One</span>
             </a>
             <nav className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto rounded-lg border border-white/10 bg-white/[.03] p-1 sm:flex-none">
