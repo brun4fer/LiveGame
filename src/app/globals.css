@@ -41,6 +41,34 @@ html {
   aspect-ratio: auto;
 }
 
+@media (min-width: 1280px) {
+  .live-tagging-layout {
+    grid-template-columns: var(--moments-panel-width, 18rem) .5rem minmax(0, 1fr);
+  }
+
+  .live-tagging-layout.is-video-expanded {
+    grid-template-columns: 0 minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .live-tagging-layout.is-video-expanded .live-tagging-moments,
+  .live-tagging-layout.is-video-expanded .live-tagging-resizer {
+    display: none;
+  }
+
+  .live-tagging-layout.is-video-expanded .live-tagging-video {
+    grid-column: 2;
+  }
+
+  .submoment-layout {
+    grid-template-columns: var(--submoment-left-panel-width, 15rem) minmax(0, 1fr) var(--submoment-right-panel-width, 22rem) !important;
+  }
+
+  .submoment-resizer {
+    display: block;
+  }
+}
+
 @media (max-width: 899px) {
   .reports-video-workspace:fullscreen {
     display: block;

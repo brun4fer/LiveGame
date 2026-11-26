@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { ArrowLeft, ChevronLeft, ChevronRight, ChevronsRight, Cloud, Crosshair, Download, FileVideo, Goal, Loader2, MapPin, Pause, Pencil, Play, RotateCcw, Save, Trash2, Upload, X } from "lucide-react";
 
 import { Coordinate, GoalSurface, PitchSurface } from "@/components/analysis-surfaces";
@@ -59,6 +59,8 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
   const [loadingCloudLibrary, setLoadingCloudLibrary] = useState(false);
   const [cloudLibraryError, setCloudLibraryError] = useState<string | null>(null);
   const [attachingAssetId, setAttachingAssetId] = useState<string | null>(null);
+  const [momentsPanelWidth, setMomentsPanelWidth] = useState(240);
+  const [submomentsPanelWidth, setSubmomentsPanelWidth] = useState(352);
   const { soundEnabled, setSoundEnabled } = useSoundPreference();
 
   useEffect(() => {
@@ -525,6 +527,25 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
     }
   }
 
+  function resizePanel(side: "left" | "right", event: ReactPointerEvent<HTMLButtonElement>) {
+    if (window.innerWidth < 1280) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = side === "left" ? momentsPanelWidth : submomentsPanelWidth;
+    const onMove = (moveEvent: PointerEvent) => {
+      const delta = moveEvent.clientX - startX;
+      const nextWidth = Math.round(Math.min(480, Math.max(190, startWidth + (side === "left" ? delta : -delta))));
+      if (side === "left") setMomentsPanelWidth(nextWidth);
+      else setSubmomentsPanelWidth(nextWidth);
+    };
+    const onEnd = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd, { once: true });
+  }
+
   if (loading) return <div className="flex min-h-[65vh] items-center justify-center text-slate-400"><Loader2 className="mr-2 animate-spin" />Preparing submoments…</div>;
   if (!match || !settings) return <Panel className="border-red-400/20 p-5 text-red-100">{notice || "Could not open this match."}</Panel>;
 
@@ -535,7 +556,7 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
 
     <Panel className="flex shrink-0 flex-wrap items-center gap-2 px-2 py-1.5"><Link href={usingLiveRecording ? `/live/${matchId}` : `/analysis/${matchId}`} className="inline-flex h-8 items-center gap-1.5 rounded-md border border-white/10 bg-white/[.04] px-2.5 text-[10px] font-semibold text-slate-300 transition hover:bg-white/[.08] hover:text-white"><ArrowLeft size={12} />{usingLiveRecording ? "Live tagging" : "Moment tagging"}</Link><span className="hidden min-w-0 max-w-48 truncate text-[10px] font-semibold text-white lg:block">{match.title}</span>{usingLiveRecording ? <Badge className="shrink-0 border-cyan-300/25 bg-cyan-300/10 text-cyan-100">Recorded live video</Badge> : null}<label className="flex min-w-0 flex-1 items-center gap-2"><span className="shrink-0 text-[9px] font-semibold uppercase tracking-[.16em] text-slate-500">Moment</span><Select className="h-8 min-w-0 flex-1 py-0 text-xs" value={filterTypeId} onChange={(event) => changeFilter(event.target.value)}><option value="">All moments ({match.moments.length})</option>{settings.momentTypes.map((type) => <option key={type.id} value={type.id}>{type.name} ({match.moments.filter((moment) => moment.momentTypeId === type.id).length})</option>)}</Select></label><Badge className="shrink-0">{selectedIndex >= 0 ? `${selectedIndex + 1} / ${moments.length}` : `0 / ${moments.length}`}</Badge><Button size="sm" variant="primary" className="h-8 shrink-0" disabled={!hasVideoSource || moments.length === 0} onClick={playAllMoments}><Play size={13} />Play all</Button>{uploading ? <Button size="sm" variant="danger" className="h-8 shrink-0" onClick={() => uploadAbortRef.current?.abort()}><X size={13} />Cancel {Math.round(uploadProgress * 100)}%</Button> : <><Button size="sm" className="h-8 shrink-0" onClick={() => fileInputRef.current?.click()}><Upload size={13} />Upload new</Button><Button size="sm" className="h-8 shrink-0" onClick={() => void downloadFullVideo()} disabled={!match.video || downloadingVideo}>{downloadingVideo ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}Download full</Button><Button size="sm" className="h-8 shrink-0" onClick={() => void openCloudLibrary()}><Cloud size={13} />Cloud library</Button></>}</Panel>
 
-    <div ref={workspaceRef} data-video-workspace className="submoment-layout relative grid min-h-0 flex-1 items-stretch gap-2 min-[900px]:grid-cols-[12rem_minmax(0,1fr)_20rem] min-[1400px]:grid-cols-[15rem_minmax(0,1fr)_22rem]">
+    <div ref={workspaceRef} data-video-workspace className="submoment-layout relative grid min-h-0 flex-1 items-stretch gap-2 min-[900px]:grid-cols-[12rem_minmax(0,1fr)_20rem] min-[1400px]:grid-cols-[15rem_minmax(0,1fr)_22rem]" style={{ "--submoment-left-panel-width": `${momentsPanelWidth}px`, "--submoment-right-panel-width": `${submomentsPanelWidth}px` } as CSSProperties & Record<"--submoment-left-panel-width" | "--submoment-right-panel-width", string>}>
       <Panel className="flex min-h-0 w-full flex-col overflow-hidden"><div className="shrink-0 border-b border-white/10 px-2.5 py-2"><Label>Tagged moments</Label><span className="ml-2 text-[9px] text-slate-600">{moments.length}</span></div><div className="min-h-0 flex-1 overflow-y-auto">{moments.length === 0 ? <p className="p-4 text-xs text-slate-500">There are no moments in this filter.</p> : moments.map((moment, index) => <button key={moment.id} onClick={() => selectMoment(moment)} className={`flex w-full items-center gap-1.5 border-b border-white/[.06] px-2 py-1.5 text-left transition hover:bg-white/[.06] ${selectedMoment?.id === moment.id ? "bg-leaf-400/10" : ""}`}><span className="w-4 shrink-0 text-right font-mono text-[8px] text-slate-600">{index + 1}</span><span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1"><span className="block truncate text-[10px] font-semibold text-white">{moment.momentType.name}</span><span className="block font-mono text-[8px] text-slate-500">{formatTime(moment.startTimeSeconds)}–{formatTime(moment.endTimeSeconds)}</span></span><Badge className="px-1 py-0 text-[8px]">{moment.subMoments.length}</Badge></button>)}</div></Panel>
 
       <div className="flex min-h-0 min-w-0 flex-col">
@@ -547,6 +568,8 @@ export function SubmomentWorkspace({ matchId }: { matchId: string }) {
 
         {selectedMoment && selectedSubMomentType ? <div className="mt-2 flex min-h-0 flex-1 flex-col border-t border-white/10 pt-2"><div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1">{editingSubmomentId ? <div className="flex items-center justify-between rounded border border-leaf-400/25 bg-leaf-400/10 px-2 py-1 text-[9px] text-emerald-100"><span>Editing saved submoment</span><Button size="sm" className="h-6 text-[9px]" onClick={cancelSubmomentEdit}><X size={10} />Cancel</Button></div> : null}{selectedSubMomentType.requiresFieldLocation ? <div><div className="mb-1 flex items-center justify-between"><Label className="text-[9px]">Occurrence location</Label><span className="inline-flex items-center gap-1 text-[8px] text-slate-500"><MapPin size={10} />{fieldMarkers.length} saved</span></div><PitchSurface points={fieldMarkers} value={fieldPoint} color={selectedSubMomentType.color} onChange={setFieldPoint} /></div> : null}{selectedSubMomentType.requiresGoalLocation ? <div><div className="mb-1 flex items-center justify-between"><Label className="text-[9px]">Goal location</Label><Goal size={11} className="text-slate-500" /></div><GoalSurface points={goalMarkers} value={goalPoint} color={selectedSubMomentType.color} onChange={setGoalPoint} /></div> : null}<label className="grid gap-1"><Label className="text-[9px]">Body part</Label><Select className="h-7 py-0 text-[10px]" value={foot} onChange={(event) => setFoot(event.target.value)}><option value="">Not specified</option><option value="right">Right foot</option><option value="left">Left foot</option><option value="head">Head</option><option value="other">Other</option></Select></label><label className="grid gap-1"><Label className="text-[9px]">Notes</Label><TextArea className="h-10 min-h-10 resize-none text-[10px]" value={notes} onChange={(event) => setNotes(event.target.value)} /></label></div><Button className="mt-1.5 h-8 w-full shrink-0 text-[10px]" variant="primary" disabled={saving} onClick={() => void saveSubmoment()}><Save size={12} />{editingSubmomentId ? "Update" : "Save"} {selectedSubMomentType.name}</Button><div className="mt-1.5 max-h-24 shrink-0 overflow-y-auto border-t border-white/10 pt-1.5"><div className="mb-1 flex items-center justify-between"><Label className="text-[9px]">Saved submoments</Label><Badge className="px-1.5 py-0.5 text-[8px]">{selectedMoment.subMoments.length}</Badge></div>{selectedMoment.subMoments.length === 0 ? <p className="text-[9px] text-slate-500">There are no submoments yet.</p> : selectedMoment.subMoments.map((submoment) => <div key={submoment.id} className="flex items-center gap-1.5 border-t border-white/[.06] py-1"><button className="flex min-w-0 flex-1 items-center gap-1.5 text-left" onClick={() => { if (submoment.timeSeconds !== null) void seekToTime(submoment.timeSeconds, false); }}><span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: submoment.subMomentType.color }} /><span className="min-w-0 flex-1 truncate text-[9px] text-slate-300">{submoment.subMomentType.name} · {formatTime(submoment.timeSeconds || 0)}</span></button><OutcomeButtons compact value={submoment.outcome} onChange={(outcome) => void toggleSubmomentOutcome(submoment, outcome)} /><Button size="icon" className="h-6 w-6" onClick={() => editSubmoment(submoment)}><Pencil size={10} /></Button><Button size="icon" variant="danger" className="h-6 w-6" onClick={() => void removeSubmoment(submoment)}><Trash2 size={10} /></Button></div>)}</div></div> : <div className="mt-2 flex min-h-0 flex-1 items-center justify-center rounded border border-dashed border-white/10 p-4 text-center text-[10px] text-slate-500">Select a moment to begin.</div>}
       </Panel>
+      <button type="button" className="submoment-resizer absolute bottom-0 left-0 top-0 z-10 hidden w-2 -translate-x-1/2 cursor-col-resize touch-none rounded bg-white/[.05] transition hover:bg-leaf-400/40" style={{ left: `${momentsPanelWidth}px` }} aria-label="Resize tagged moments panel" title="Drag to resize tagged moments" onPointerDown={(event) => resizePanel("left", event)} />
+      <button type="button" className="submoment-resizer absolute bottom-0 right-0 top-0 z-10 hidden w-2 translate-x-1/2 cursor-col-resize touch-none rounded bg-white/[.05] transition hover:bg-leaf-400/40" style={{ right: `${submomentsPanelWidth}px` }} aria-label="Resize submoments panel" title="Drag to resize submoments" onPointerDown={(event) => resizePanel("right", event)} />
     </div>
     {showCloudLibrary ? <CloudVideoLibrary assets={cloudAssets} loading={loadingCloudLibrary} error={cloudLibraryError} attachingAssetId={attachingAssetId} onRetry={() => void openCloudLibrary()} onClose={() => !attachingAssetId && setShowCloudLibrary(false)} onSelect={(asset) => void attachSelectedCloudVideo(asset)} /> : null}
   </div>;

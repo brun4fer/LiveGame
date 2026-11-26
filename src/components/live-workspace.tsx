@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, AlertTriangle, ArrowLeft, Camera, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Link2, Loader2, Pause, Pencil, Play, Radio, RotateCcw, RotateCw, Settings2, Smartphone, Trash2, Users, Video, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { Activity, AlertTriangle, ArrowLeft, Camera, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Expand, Link2, Loader2, Minimize2, Pause, Pencil, Play, Radio, RotateCcw, RotateCw, Settings2, Smartphone, Trash2, Users, Video, X } from "lucide-react";
 
 import { MatchEditDialog } from "@/components/match-edit-dialog";
 import { MomentEditDialog } from "@/components/moment-edit-dialog";
@@ -14,7 +14,7 @@ import { useSoundPreference, VideoAudioToggle } from "@/components/video-audio-t
 import { YouTubePlayer } from "@/components/youtube-player";
 import type { AccountPayload, LiveSegmentRecord, LiveSessionRecord, MatchDetail, MomentRecord, SettingsPayload } from "@/lib/domain";
 import { apiFetch } from "@/lib/http";
-import { getYouTubeVideoId } from "@/lib/external-video";
+import { getExternalVideoKind, supportsExternalClipExport } from "@/lib/external-video";
 import { closeWebRtcSession, publishCameraStream, receiveCameraStream, type BrowserWebRtcSession } from "@/lib/cloudflare-webrtc";
 import { getRememberedMatchVideoParts, rememberMatchVideoPart, type LocalMatchVideoPart, type LocalVideoFileHandle } from "@/lib/local-video-store";
 import { getReplayEdge, locateReplayPosition } from "@/lib/live-replay";
@@ -22,7 +22,7 @@ import { getMatchPeriodAtTime } from "@/lib/match-periods";
 import { shouldUploadReplayFromOrigin } from "@/lib/replay-upload-origin";
 import { SmartVideoExportSession } from "@/lib/smart-video-export";
 import { formatTime, roundTime } from "@/lib/time";
-import { downloadBlob, exportSegmentedMomentClip, planSegmentedMomentExport, type TimedVideoSource } from "@/lib/video-export";
+import { downloadBlob, exportMomentClip, exportSegmentedMomentClip, planSegmentedMomentExport, type TimedVideoSource } from "@/lib/video-export";
 
 const CAPTURE_MODE_KEY = "live-game-capture-mode";
 const CAMERA_ROTATIONS_KEY = "live-game-camera-rotations";
@@ -268,6 +268,7 @@ async function createRotatedCameraStream(source: MediaStream, rotation: Exclude<
 export function LiveWorkspace({ matchId }: { matchId: string }) {
   const router = useRouter();
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const externalVideoRef = useRef<HTMLVideoElement | null>(null);
   const replayVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteLiveVideoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -351,6 +352,8 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const [externalPlayerTime, setExternalPlayerTime] = useState(0);
   const [externalPlayerEdge, setExternalPlayerEdge] = useState(0);
   const [externalPlayerReady, setExternalPlayerReady] = useState(false);
+  const [momentsPanelWidth, setMomentsPanelWidth] = useState(288);
+  const [videoHorizontallyExpanded, setVideoHorizontallyExpanded] = useState(false);
   const [wirelessCamera, setWirelessCamera] = useState<WirelessCameraStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
@@ -552,6 +555,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const wirelessPartActive = Boolean(wirelessCamera?.broadcasting);
   const wirelessStartPending = Boolean(wirelessCamera?.desiredBroadcasting && !wirelessCamera.broadcasting);
   const externalLinkMode = session?.provider === "external-link";
+  const externalVideoKind = getExternalVideoKind(session?.playbackUrl || "");
   const externalElapsedSeconds = externalLinkMode && session?.startedAt
     ? Math.max(0, (clock - Date.parse(session.startedAt)) / 1000)
     : 0;
@@ -569,6 +573,20 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
   const canStartCameraRecording = !activeLive || session?.startedBy.id === account?.id;
   const currentPeriod = match ? getMatchPeriodAtTime(match, currentTime) : null;
   const lastMoment = match?.moments.reduce<MomentRecord | null>((latest, moment) => !latest || Date.parse(moment.createdAt) > Date.parse(latest.createdAt) ? moment : latest, null) || null;
+
+  function resizeMomentsPanel(event: ReactPointerEvent<HTMLButtonElement>) {
+    if (window.innerWidth < 1280 || videoHorizontallyExpanded) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = momentsPanelWidth;
+    const onMove = (moveEvent: PointerEvent) => setMomentsPanelWidth(Math.round(Math.min(480, Math.max(190, startWidth + moveEvent.clientX - startX))));
+    const onEnd = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd, { once: true });
+  }
 
   useEffect(() => {
     const playbackUrl = session?.playbackUrl;
@@ -1318,8 +1336,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
 
   async function startExternalLink() {
     const link = externalLinkInput.trim();
-    if (!getYouTubeVideoId(link)) {
-      setNotice("Enter a valid YouTube video or live-stream link.");
+    const kind = getExternalVideoKind(link);
+    if (kind === "invalid") {
+      setNotice("Enter a valid HTTPS video, live-stream or provider link.");
       return;
     }
     setStartingExternalLink(true);
@@ -1336,9 +1355,13 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       setExternalPlayerReady(false);
       setPaused(false);
       setShowExternalLink(false);
-      setNotice("The YouTube source is now visible to everyone who opens this match. Use the YouTube player controls if the broadcast is already in progress.");
+      setNotice(kind === "direct"
+        ? "The direct video source is shared. Tagged moments can be exported if the provider allows CORS access."
+        : kind === "youtube"
+          ? "The YouTube source is now visible to everyone who opens this match. Use the player controls if the broadcast is already in progress."
+          : "The provider link is shared. If the provider blocks embedding, use its direct MP4/HLS camera URL to tag and export clips.");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The YouTube link could not be opened.");
+      setNotice(error instanceof Error ? error.message : "The external link could not be opened.");
     } finally {
       setStartingExternalLink(false);
     }
@@ -1693,7 +1716,22 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
     setExportingMomentId(moment.id);
     const part = localParts.find((item) => moment.startTimeSeconds >= item.startTimeSeconds - 0.05 && moment.endTimeSeconds <= item.startTimeSeconds + item.durationSeconds + 0.05);
     try {
-      if (part) {
+      if (externalLinkMode) {
+        const sourceUrl = session?.playbackUrl || "";
+        if (!supportsExternalClipExport(sourceUrl)) {
+          throw new Error("This provider page cannot be cut in the browser. Use the direct MP4/HLS camera URL, or upload the video to the cloud library first.");
+        }
+        setNotice(`Preparing ${moment.momentType.name} from the external source...`);
+        const result = await exportMomentClip({
+          sourceUrl,
+          match,
+          moment,
+          quality: "standard",
+          includeAudio: soundEnabled,
+          onStatus: (message) => setNotice(message),
+        });
+        downloadBlob(result.blob, result.fileName);
+      } else if (part) {
         const localMoment = {
           ...moment,
           startTimeSeconds: Math.max(0, moment.startTimeSeconds - part.startTimeSeconds),
@@ -1878,7 +1916,7 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
               : void connectCamera()}
           disabled={wirelessMode || pausing || stopping}
         ><Camera size={13} /></Button>
-        <Button size="icon" className="h-8 w-8" title="Use a YouTube video or live-stream link" aria-label="Use a YouTube link" onClick={() => { setExternalLinkInput(session?.provider === "external-link" ? session.playbackUrl || "" : ""); setShowExternalLink((value) => !value); }} disabled={recording || wirelessPartActive || wirelessStartPending || stopping}><Link2 size={13} /></Button>
+        <Button size="icon" className="h-8 w-8" title="Use an external video, live-stream or provider link" aria-label="Use an external video link" onClick={() => { setExternalLinkInput(session?.provider === "external-link" ? session.playbackUrl || "" : ""); setShowExternalLink((value) => !value); }} disabled={recording || wirelessPartActive || wirelessStartPending || stopping}><Link2 size={13} /></Button>
         <Button size="icon" className="h-8 w-8" title={wirelessMode ? "The wireless phone is already paired" : "Connect a wireless phone camera"} aria-label="Connect a wireless phone camera" onClick={() => setPairingPhone(true)} disabled={Boolean(wirelessCamera?.ready) || recording || wirelessPartActive || wirelessStartPending || stopping}><Smartphone size={13} /></Button>
         {externalLinkMode && activeLive ? <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopExternalLink()} disabled={stopping}><CircleStop size={12} />{stopping ? "Ending…" : "End link"}</Button> : wirelessMode ? (!activeLive || partPaused
           ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startWirelessPart()} disabled={!wirelessCamera?.ready || pausing || stopping}><Radio size={12} />{pausing ? "Starting…" : activeLive ? "Start next part" : wirelessCamera?.ready ? "Start live" : "Waiting for phone"}</Button>{activeLive ? <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopWirelessMatch()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End match"}</Button> : null}</>
@@ -1887,9 +1925,9 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
       </div>
     </Panel>
 
-    {showExternalLink ? <Panel className="flex shrink-0 flex-col gap-2 border-cyan-300/20 p-3 sm:flex-row sm:items-end"><label className="grid min-w-0 flex-1 gap-1"><span className="text-[10px] font-semibold uppercase tracking-[.16em] text-slate-500">YouTube video or live-stream link</span><input autoFocus type="url" value={externalLinkInput} onChange={(event) => setExternalLinkInput(event.target.value)} placeholder="https://www.youtube.com/watch?v=…" className="h-9 w-full rounded-md border border-white/10 bg-black/20 px-3 text-xs text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50" /></label><Button variant="primary" className="h-9 shrink-0" disabled={startingExternalLink || !externalLinkInput.trim()} onClick={() => void startExternalLink()}>{startingExternalLink ? <Loader2 size={14} className="animate-spin" /> : <Link2 size={14} />}Show video</Button><Button className="h-9 shrink-0" onClick={() => setShowExternalLink(false)}>Cancel</Button><p className="text-[10px] leading-4 text-slate-500 sm:max-w-72">Everyone in this workspace who opens the match will see the same source. YouTube playback controls remain available in the player.</p></Panel> : null}
+    {showExternalLink ? <Panel className="flex shrink-0 flex-col gap-2 border-cyan-300/20 p-3 sm:flex-row sm:items-end"><label className="grid min-w-0 flex-1 gap-1"><span className="text-[10px] font-semibold uppercase tracking-[.16em] text-slate-500">External video, live-stream or provider link</span><input autoFocus type="url" value={externalLinkInput} onChange={(event) => setExternalLinkInput(event.target.value)} placeholder="https://provider.example/live-camera.m3u8" className="h-9 w-full rounded-md border border-white/10 bg-black/20 px-3 text-xs text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50" /></label><Button variant="primary" className="h-9 shrink-0" disabled={startingExternalLink || !externalLinkInput.trim()} onClick={() => void startExternalLink()}>{startingExternalLink ? <Loader2 size={14} className="animate-spin" /> : <Link2 size={14} />}Show video</Button><Button className="h-9 shrink-0" onClick={() => setShowExternalLink(false)}>Cancel</Button><p className="text-[10px] leading-4 text-slate-500 sm:max-w-72">YouTube, direct MP4/WebM/HLS sources and provider pages are accepted. Export requires a direct source that permits CORS; protected provider pages may be view-only.</p></Panel> : null}
 
-    {cameraProblem ? <div role="alert" className="flex shrink-0 flex-col gap-3 rounded-xl border border-amber-300/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-50 sm:flex-row sm:items-center">
+    {cameraProblem ? <div role="alert" className="relative flex shrink-0 flex-col gap-3 rounded-xl border border-amber-300/30 bg-amber-400/10 px-4 py-3 pr-11 text-sm text-amber-50 sm:flex-row sm:items-center">
       <AlertTriangle size={18} className="shrink-0 text-amber-300" />
       <span className="min-w-0 flex-1"><span className="block">{cameraProblem}</span><span className="mt-1 block text-[10px] text-amber-100/60">{captureDiagnosticSummary}</span></span>
       <Button
@@ -1899,14 +1937,21 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
         disabled={pausing || stopping}
         onClick={() => paused && activeLive ? void resumeRecording() : void connectCamera()}
       ><Camera size={14} />{pausing ? "Saving current part…" : paused && activeLive ? "Reconnect & continue" : "Reconnect camera"}</Button>
+      <button type="button" title="Dismiss camera message" aria-label="Dismiss camera message" onClick={() => setCameraProblem(null)} className="absolute right-3 top-3 rounded p-1 text-amber-100/70 transition hover:bg-amber-100/10 hover:text-white"><X size={15} /></button>
     </div> : null}
 
     {notice ? <div role="status" aria-live="polite" className="fixed bottom-4 right-4 z-50 flex max-w-sm items-start gap-3 rounded-xl border border-cyan-300/25 bg-pitch-950/95 px-4 py-3 text-sm text-cyan-50 shadow-2xl backdrop-blur-xl"><span className="min-w-0 flex-1">{notice}</span><button type="button" aria-label="Dismiss message" onClick={() => setNotice(null)} className="shrink-0 text-cyan-200/70 transition hover:text-white"><X size={15} /></button></div> : null}
 
-    <div className="grid min-h-0 flex-1 items-stretch gap-2 xl:grid-cols-[18rem_minmax(0,1fr)]">
-      <Panel className="order-2 flex min-h-0 min-w-0 flex-col overflow-hidden">
+    <div className={`live-tagging-layout ${videoHorizontallyExpanded ? "is-video-expanded" : ""} grid min-h-0 flex-1 items-stretch gap-2`} style={{ "--moments-panel-width": `${momentsPanelWidth}px` } as CSSProperties & Record<"--moments-panel-width", string>}>
+      <Panel className="live-tagging-video order-1 flex min-h-0 min-w-0 flex-col overflow-hidden xl:order-3">
         <div className="relative aspect-video min-h-72 shrink-0 bg-black xl:aspect-auto xl:min-h-0 xl:flex-1">
-          {externalLinkMode && session?.playbackUrl ? <YouTubePlayer url={session.playbackUrl} soundEnabled={soundEnabled} onTimeUpdate={(seconds) => { setExternalPlayerReady(true); setExternalPlayerTime(seconds); setExternalPlayerEdge((current) => Math.max(current, seconds)); }} /> : atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{partPaused ? "Recording part saved" : activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : wirelessMode ? "Phone camera ready" : "Connect the match camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">{partPaused ? "Select a tagged moment to review it, or start the next recording part." : "Recording continues while you independently control replay."}</p></div>}
+          {externalLinkMode && session?.playbackUrl
+            ? externalVideoKind === "youtube"
+              ? <YouTubePlayer url={session.playbackUrl} soundEnabled={soundEnabled} onTimeUpdate={(seconds) => { setExternalPlayerReady(true); setExternalPlayerTime(seconds); setExternalPlayerEdge((current) => Math.max(current, seconds)); }} />
+              : externalVideoKind === "direct"
+                ? <video ref={externalVideoRef} src={session.playbackUrl} crossOrigin="anonymous" controls autoPlay playsInline muted={!soundEnabled} className="h-full w-full object-contain" onLoadedMetadata={(event) => { const seconds = Math.max(0, event.currentTarget.currentTime || 0); setExternalPlayerReady(true); setExternalPlayerTime(seconds); setExternalPlayerEdge((current) => Math.max(current, seconds)); }} onTimeUpdate={(event) => { const seconds = Math.max(0, event.currentTarget.currentTime || 0); setExternalPlayerReady(true); setExternalPlayerTime(seconds); setExternalPlayerEdge((current) => Math.max(current, seconds)); }} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} />
+                : <div className="flex h-full flex-col bg-black"><iframe title="External camera provider" src={session.playbackUrl} className="min-h-0 flex-1 border-0" allow="autoplay; fullscreen; picture-in-picture" /><div className="shrink-0 border-t border-amber-300/20 bg-amber-300/10 px-3 py-2 text-center text-[10px] text-amber-100">This provider page can only be viewed here. Use its direct MP4/HLS camera URL to mark exact timestamps and export clips.</div></div>
+            : atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{partPaused ? "Recording part saved" : activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : wirelessMode ? "Phone camera ready" : "Connect the match camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">{partPaused ? "Select a tagged moment to review it, or start the next recording part." : "Recording continues while you independently control replay."}</p></div>}
           {showingRemoteLive && remotePlaybackNeedsAction ? <button type="button" onClick={() => void remoteLiveVideoRef.current?.play()} className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm font-semibold text-white"><span className="rounded-lg border border-cyan-300/35 bg-pitch-950/90 px-4 py-3"><Play size={16} className="mr-2 inline" />Start live video</span></button> : null}
           {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${partPaused ? "bg-amber-600" : "bg-red-600"}`}>{partPaused ? "INTERVAL · PART SAVED" : "● RECORDING"}</span> : null}
           {activeLive ? <span className={`absolute right-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold ${atLiveEdge ? "bg-cyan-300 text-slate-950" : "bg-slate-900/85 text-cyan-100"}`}>{atLiveEdge ? "LIVE" : `REPLAY · ${formatTime(behindLive)} behind`}</span> : null}
@@ -1927,12 +1972,13 @@ export function LiveWorkspace({ matchId }: { matchId: string }) {
               <div className="ml-1 flex items-center gap-1 border-l border-white/10 pl-2" aria-label="Match period markers">{periodMarkers.map(([key, label], index) => { const seconds = match[key]; const style = periodStyles[index]; const period = index < 2 ? "first_half" : "second_half"; return <div key={key} className="flex overflow-hidden rounded-md border" style={{ borderColor: `${style.color}${currentPeriod === period ? "cc" : "55"}` }}><button type="button" disabled={!cameraConnected && !canReplay} title={seconds === null ? `${label}: save the current video time` : `${label}: go to ${formatTime(seconds)}`} onClick={() => seconds === null ? void setPeriodMarker(key) : void seekVirtual(seconds, true)} className="flex h-8 min-w-[3.6rem] flex-col items-center justify-center px-1.5 leading-none disabled:opacity-40" style={{ backgroundColor: `${style.color}${currentPeriod === period ? "20" : "0c"}` }}><span className="text-[7px] font-bold uppercase tracking-wide" style={{ color: style.color }}>{style.short}</span><span className="mt-0.5 font-mono text-[8px] text-slate-300">{seconds === null ? "Set" : formatTime(seconds)}</span></button>{seconds !== null ? <button type="button" title={`Replace ${label} with the current time`} onClick={() => void setPeriodMarker(key)} className="flex h-8 w-5 items-center justify-center border-l text-slate-500 hover:text-white" style={{ borderColor: `${style.color}45` }}><Clock3 size={9} /></button> : null}</div>; })}</div>
               <form className="ml-1 flex items-center gap-1 border-l border-white/10 pl-2" onSubmit={(event) => { event.preventDefault(); goToExactTime(); }}><input aria-label="Exact second" className="h-8 w-20 rounded-md border border-white/10 bg-black/20 px-2 font-mono text-[10px] text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50" type="number" min="0" max={availableEdgeSeconds || undefined} step="0.1" placeholder="Second" value={seekTime} onChange={(event) => setSeekTime(event.target.value)} disabled={!canReplay} /><Button type="submit" size="sm" className="h-8 px-2 text-[10px]" disabled={!canReplay || seekTime === ""}>Go</Button></form>
             </div></div>
-            <div className="flex shrink-0 items-center gap-2"><span className="hidden items-center gap-1 font-mono text-xs text-white sm:inline-flex"><Clock3 size={13} className="text-cyan-200" />{formatTime(currentTime)} / {formatTime(liveEdgeSeconds)}</span><VideoAudioToggle compact soundEnabled={soundEnabled} onChange={setSoundEnabled} />{match.moments.length > 0 ? <Link href={`/analysis/${matchId}/submoments`} className="inline-flex h-8 items-center gap-1 rounded-md bg-cyan-300 px-2 text-[10px] font-medium text-slate-950 transition hover:bg-cyan-200">Identify submoments <ChevronsRight size={13} /></Link> : <Button size="sm" variant="primary" className="h-8 px-2 text-[10px]" disabled>Identify submoments <ChevronsRight size={13} /></Button>}</div>
+            <div className="flex shrink-0 items-center gap-2"><span className="hidden items-center gap-1 font-mono text-xs text-white sm:inline-flex"><Clock3 size={13} className="text-cyan-200" />{formatTime(currentTime)} / {formatTime(liveEdgeSeconds)}</span><VideoAudioToggle compact soundEnabled={soundEnabled} onChange={setSoundEnabled} /><Button size="icon" className="hidden h-8 w-8 xl:inline-flex" title={videoHorizontallyExpanded ? "Restore panels" : "Expand video horizontally"} aria-label={videoHorizontallyExpanded ? "Restore panels" : "Expand video horizontally"} onClick={() => setVideoHorizontallyExpanded((value) => !value)}>{videoHorizontallyExpanded ? <Minimize2 size={14} /> : <Expand size={14} />}</Button>{match.moments.length > 0 ? <Link href={`/analysis/${matchId}/submoments`} className="inline-flex h-8 items-center gap-1 rounded-md bg-cyan-300 px-2 text-[10px] font-medium text-slate-950 transition hover:bg-cyan-200">Identify submoments <ChevronsRight size={13} /></Link> : <Button size="sm" variant="primary" className="h-8 px-2 text-[10px]" disabled>Identify submoments <ChevronsRight size={13} /></Button>}</div>
           </div>
         </div>
       </Panel>
 
-      <Panel className="order-1 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
+      <button type="button" aria-label="Resize tagged moments panel" title="Drag to resize the tagged moments panel" onPointerDown={resizeMomentsPanel} className="live-tagging-resizer order-2 hidden cursor-col-resize touch-none rounded bg-white/[.05] transition hover:bg-cyan-300/35 xl:block" />
+      <Panel className="live-tagging-moments order-2 flex min-h-48 flex-col overflow-hidden xl:order-1 xl:min-h-0">
         <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Tagged moments</p><p className="mt-1 text-xs text-slate-400">{match.moments.length} in the recording</p></div><Badge title={liveViewers.map((viewer) => `${viewer.user.name} · ${viewer.atLiveEdge ? "live" : "replay"}`).join("\n")}><Users size={11} className="mr-1" />{liveViewers.length || (account ? 1 : 0)}</Badge></div><p className="mt-2 text-[10px] leading-4 text-slate-500">Select a row to review it without stopping the recording.</p></div>
         <div className="min-h-0 flex-1 overflow-y-auto">{match.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Tagged moments will appear here.</p> : match.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}${moment.createdBy ? ` · ${moment.createdBy.name}` : ""}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><OutcomeButtons compact value={moment.outcome} onChange={(outcome) => void toggleOutcome(moment, outcome)} /><button type="button" className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-violet-300/25 bg-violet-300/10 text-violet-100 hover:bg-violet-300/20 disabled:cursor-wait disabled:opacity-40" onClick={() => void exportMoment(moment)} disabled={Boolean(exportingMomentId)} aria-label={`Download ${moment.momentType.name}`} title="Download this moment as MP4 without stopping the recording">{exportingMomentId === moment.id ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] text-cyan-100" onClick={() => setEditingMoment(moment)}><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removeMoment(moment)}><Trash2 size={11} />Delete</button>{moment.notes ? <p className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] leading-4 text-amber-200">{moment.notes}</p> : null}</div>)}</div>
       </Panel>
